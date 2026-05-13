@@ -1,0 +1,1699 @@
+install.packages("bigrquery")
+library(bigrquery)
+bq_auth()
+
+projectid = "project-3821312a-fb0b-42e4-8f0"
+# 你的SQL查询
+sql <- "
+WITH base_icu AS (
+  -- 每个患者首次ICU入院
+  SELECT
+    subject_id,
+    stay_id,
+    hadm_id,
+    intime,
+    outtime,
+    DATETIME_DIFF(outtime, intime, HOUR) AS icu_length_hours
+  FROM `physionet-data.mimiciv_3_1_icu.icustays`
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY subject_id ORDER BY intime ASC) = 1
+),
+valid_icu AS (
+  -- ICU住院≥24小时
+  SELECT * FROM base_icu WHERE icu_length_hours >= 24
+),
+first_day_gcs AS (
+  SELECT
+    g.subject_id,
+    g.stay_id,
+    MIN(g.gcs) AS first_day_gcs
+  FROM `physionet-data.mimiciv_3_1_derived.gcs` g
+  JOIN base_icu b ON g.stay_id = b.stay_id
+  WHERE 
+    g.charttime <= DATETIME_ADD(b.intime, INTERVAL 24 HOUR)
+  GROUP BY g.subject_id, g.stay_id
+),
+adult_patients AS (
+  SELECT
+    v.*,
+    a.age,
+    p.gender
+  FROM valid_icu v
+  JOIN `physionet-data.mimiciv_3_1_derived.age` a ON v.hadm_id = a.hadm_id
+  JOIN `physionet-data.mimiciv_3_1_hosp.patients` p ON v.subject_id = p.subject_id
+  WHERE a.age >= 18
+),
+final_cohort AS (
+  SELECT DISTINCT
+    a.*,
+    s.sofa_score,
+    s.sepsis3,
+    s.culture_time,
+    s.sofa_time,
+    s.suspected_infection_time,
+    g.first_day_gcs,
+
+    -- sepsis3 在 24h 内
+    IF(
+      DATETIME_DIFF(
+        GREATEST(s.culture_time, s.sofa_time),
+        a.intime,
+        HOUR
+      ) < 24, 1, 0
+    ) AS sepsis3_firstday,
+
+    -- normal_GCS：GCS=15 =1，否则=0，NULL也算15
+    IF(IFNULL(g.first_day_gcs, 15) = 15, 1, 0) AS normal_GCS
+
+  FROM adult_patients a
+  LEFT JOIN `physionet-data.mimiciv_3_1_derived.sepsis3` s ON a.stay_id = s.stay_id
+  LEFT JOIN first_day_gcs g ON a.stay_id = g.stay_id
+
+  -- 删除 WHERE s.sepsis3 = true 
+)
+SELECT * FROM final_cohort;
+"
+
+bq_job <- bq_project_query(projectid, query = sql)
+
+df <- bq_table_download(bq_job)
+# 查看数据前几行
+head(df)
+
+# 查看数据的行列数
+dim(df)
+
+# 画 GCS 分布图（直方图）
+hist(
+  df$first_day_gcs,          # 你要画的变量
+  main = "GCS Distribution", # 标题
+  xlab = "First Day GCS",    # X轴名字
+  col = "lightblue",         # 颜色
+  breaks = 10,               # 柱子数量
+  na.rm = TRUE               # 去掉空值（必须加）
+)
+
+# 1. 总人数
+nrow(df)
+
+# 2. sepsis3 first day = 1 的人数
+sum(df$sepsis3_firstday == 1, na.rm = TRUE)
+
+# 3. 先筛选出 sepsis3_firstday=1 的人
+group2 <- df[df$sepsis3_firstday == 1, ]
+
+# 再算其中 normal_GCS=0 的人数（GCS不正常）
+sum(group2$normal_GCS == 0, na.rm = TRUE)
+
+
+# ==============================
+# 读取你下载到桌面的两个表格
+# ==============================
+
+# 1. 读取 CAM-ICU 表
+cam_icu <- read.csv("~/Desktop/cam_icu.csv", stringsAsFactors = FALSE)
+
+# 2. 读取 delirium_drug 表
+delirium_drug <- read.csv("~/Desktop/delirium_drug.csv", stringsAsFactors = FALSE)
+
+# ==============================
+# 查看是否成功（运行后会显示行数）
+# ==============================
+nrow(cam_icu)
+nrow(delirium_drug)
+
+#新表处理
+#delirium_drug
+# 1. 生成一个空向量，长度和数据行数一致
+drug_used_vec <- rep(0, nrow(delirium_drug))
+
+# 2. 标记用药记录：delirium_drug_rate > 0 就标记为1
+drug_used_vec[delirium_drug$delirium_drug_rate > 0 & !is.na(delirium_drug$delirium_drug_rate)] <- 1
+
+# 3. 按 stay_id 汇总：只要用过药就记为1
+drug_use <- aggregate(
+  drug_used_vec,
+  list(stay_id = delirium_drug$stay_id),
+  max,
+  na.rm = TRUE
+)
+
+# 4. 改列名
+colnames(drug_use) <- c("stay_id", "drug_used")
+
+# 5. 检查结果（必须看到结果）
+head(drug_use)
+nrow(drug_use)
+
+#cam_icu
+# ==============================
+# 1. 先运行这一段：创建 drug_use
+# ==============================
+drug_use <- aggregate(
+  delirium_drug$delirium_drug_rate,
+  list(stay_id = delirium_drug$stay_id),
+  function(x) ifelse(any(x > 0, na.rm = TRUE), 1, 0)
+)
+colnames(drug_use) <- c("stay_id", "drug_used")
+head(drug_use) # 确认这一步有结果！
+
+# ==============================
+# 2. 再运行这一段：创建 cam_clean
+# ==============================
+cam_clean <- merge(
+  cam_icu,
+  df[, c("stay_id", "intime")],
+  by = "stay_id",
+  all.x = TRUE
+)
+
+# 要求的时间窗口：入ICU前 → 入ICU后24小时
+cam_clean <- cam_clean[
+  cam_clean$charttime <= cam_clean$intime + 24 * 3600,
+]
+
+# 每个患者只保留最早的一条记录
+cam_clean <- cam_clean[order(cam_clean$stay_id, cam_clean$charttime), ]
+first_row <- !duplicated(cam_clean$stay_id)
+cam_clean <- cam_clean[first_row, ]
+
+# 只保留需要的列
+cam_clean <- cam_clean[, c("stay_id", "cam_icu_derived")]
+colnames(cam_clean)[2] <- "cam_icu"
+head(cam_clean) # 确认这一步有结果！
+
+# ==============================
+# 3. 最后运行合并代码
+# ==============================
+df_final <- df
+
+# 合并 first_day_drug_used
+df_final$first_day_drug_used <- drug_use$drug_used[match(df_final$stay_id, drug_use$stay_id)]
+df_final$first_day_drug_used[is.na(df_final$first_day_drug_used)] <- 0
+
+# 合并 first_day_cam_icu
+df_final$first_day_cam_icu <- cam_clean$cam_icu[match(df_final$stay_id, cam_clean$stay_id)]
+
+# 转换成 0/1
+df_final$first_day_cam_icu <- ifelse(
+  df_final$first_day_cam_icu == "Positive", 1,
+  ifelse(df_final$first_day_cam_icu == "Negative", 0, NA)
+)
+
+# 最终检查
+nrow(df_final) # 必须 = 52447
+
+
+# 04/29数据导出
+# ==============================
+# 筛选目标人群
+# ==============================
+df_teacher <- df_final[
+  df_final$sepsis3 == TRUE &    # 有 Sepsis3
+    df_final$normal_GCS == 0 &    # GCS 不正常
+    !is.na(df_final$sepsis3),     # 不去掉空值
+]
+
+# 检查人数
+nrow(df_teacher)
+
+# 导出到桌面
+write.csv(df_teacher, "~/Desktop/文献1数据.csv", row.names = F)
+
+
+#5/5自行检查
+
+# 检查 df_final_new 的列名
+colnames(df_final_new)
+
+# 检查 admissions 表的列名
+colnames(admissions)
+
+# 检查 hadm_id 匹配情况
+table(df_final$hadm_id %in% admissions$hadm_id)
+
+
+
+#5/5新加内容
+# 1. 先把 admissions 表拉下来（只跑一次，后面不用再联网）
+library(bigrquery)
+bq_auth()
+
+projectid = "project-3821312a-fb0b-42e4-8f0"
+sql_adm <- "
+SELECT hadm_id, race, insurance, language, marital_status
+FROM `physionet-data.mimiciv_3_1_hosp.admissions`
+"
+bq_job_adm <- bq_project_query(projectid, query = sql_adm)
+admissions <- bq_table_download(bq_job_adm)
+
+# 2. 【关键】离线合并到现有的 df_final
+df_final_new <- merge(
+  x = df_final,  # 你已经跑好的主表，直接用
+  y = admissions,
+  by = "hadm_id",
+  all.x = TRUE  # 左连接，不丢任何患者数据
+)
+
+# 3. 清洗admission变量
+trim_upper <- function(x) {
+  toupper(trimws(x))
+}
+
+df_final_new$race_clean <- trim_upper(df_final_new$race)
+df_final_new$language_clean <- trim_upper(df_final_new$language)
+df_final_new$insurance_clean <- trim_upper(df_final_new$insurance)
+df_final_new$marital_clean <- trim_upper(df_final_new$marital_status)
+
+# 清洗race
+df_final_new$race_cat <- ifelse(
+  grepl("^ASIAN", df_final_new$race_clean), "Asian",
+  ifelse(
+    grepl("^WHITE", df_final_new$race_clean) | df_final_new$race_clean == "PORTUGUESE", "White",
+    ifelse(
+      grepl("^BLACK", df_final_new$race_clean), "Black",
+      ifelse(
+        grepl("HISPANIC|LATINO", df_final_new$race_clean) | df_final_new$race_clean == "SOUTH AMERICAN", "Hispanic/Latino",
+        ifelse(
+          df_final_new$race_clean %in% c("UNKNOWN", "UNABLE TO OBTAIN"), "Unknown/Unable to Obtain",
+          "Other"
+        )
+      )
+    )
+  )
+)
+df_final_new$race_cat <- factor(
+  df_final_new$race_cat,
+  levels = c("Asian", "White", "Black", "Hispanic/Latino", "Unknown/Unable to Obtain", "Other")
+)
+
+# 清洗language
+df_final_new$language_cat <- ifelse(
+  is.na(df_final_new$language_clean), NA,
+  ifelse(grepl("^ENGLISH", df_final_new$language_clean), "English", "Other")
+)
+df_final_new$language_cat <- factor(
+  df_final_new$language_cat,
+  levels = c("English", "Other")
+)
+
+# 清洗insurance
+df_final_new$insurance_cat <- ifelse(
+  is.na(df_final_new$insurance_clean), NA,
+  ifelse(
+    grepl("MEDICAID|MEDICARE", df_final_new$insurance_clean), "Medicaid/Medicare",
+    ifelse(grepl("PRIVATE", df_final_new$insurance_clean), "Private", "Other")
+  )
+)
+df_final_new$insurance_cat <- factor(
+  df_final_new$insurance_cat,
+  levels = c("Medicaid/Medicare", "Private", "Other")
+)
+
+# 清洗marital status
+df_final_new$marital_cat <- ifelse(
+  is.na(df_final_new$marital_clean), NA,
+  ifelse(grepl("MARRIED", df_final_new$marital_clean), "Married", "Other")
+)
+df_final_new$marital_cat <- factor(
+  df_final_new$marital_cat,
+  levels = c("Married", "Other")
+)
+
+# 删除中间变量
+df_final_new <- df_final_new[, !colnames(df_final_new) %in% 
+                               c("race_clean", "language_clean", "insurance_clean", "marital_clean")]
+
+# 4. 检查结果
+nrow(df_final_new)  # 52447，和原来完全一致
+colnames(df_final_new) # 会包含race_cat, insurance_cat等所有清洗后的变量
+
+#5/5修改2.0
+
+# 1. 重命名 admissions 表的变量
+names(df_final_new)[names(df_final_new) == "race.y"] <- "race"
+names(df_final_new)[names(df_final_new) == "insurance.y"] <- "insurance"
+
+# 2. 删掉重复的旧变量（主表原来的 race.x/insurance.x 可以不用了）
+df_final_new <- df_final_new[, !colnames(df_final_new) %in% c("race.x", "insurance.x")]
+
+# 检查一下列名
+colnames(df_final_new)
+
+# 3. 清洗 admission 变量
+trim_upper <- function(x) {
+  toupper(trimws(x))
+}
+
+# 清洗前先检查变量是否存在
+all(c("race", "insurance", "language", "marital_status") %in% colnames(df_final_new))
+
+# 统一格式：去空格+转大写
+df_final_new$race_clean <- trim_upper(df_final_new$race)
+df_final_new$language_clean <- trim_upper(df_final_new$language)
+df_final_new$insurance_clean <- trim_upper(df_final_new$insurance)
+df_final_new$marital_clean <- trim_upper(df_final_new$marital_status)
+
+# 清洗 race
+df_final_new$race_cat <- ifelse(
+  grepl("^ASIAN", df_final_new$race_clean), "Asian",
+  ifelse(
+    grepl("^WHITE", df_final_new$race_clean) | df_final_new$race_clean == "PORTUGUESE", "White",
+    ifelse(
+      grepl("^BLACK", df_final_new$race_clean), "Black",
+      ifelse(
+        grepl("HISPANIC|LATINO", df_final_new$race_clean) | df_final_new$race_clean == "SOUTH AMERICAN", "Hispanic/Latino",
+        ifelse(
+          df_final_new$race_clean %in% c("UNKNOWN", "UNABLE TO OBTAIN"), "Unknown/Unable to Obtain",
+          "Other"
+        )
+      )
+    )
+  )
+)
+df_final_new$race_cat <- factor(
+  df_final_new$race_cat,
+  levels = c("Asian", "White", "Black", "Hispanic/Latino", "Unknown/Unable to Obtain", "Other")
+)
+
+# 清洗 language
+df_final_new$language_cat <- ifelse(
+  is.na(df_final_new$language_clean), NA,
+  ifelse(grepl("^ENGLISH", df_final_new$language_clean), "English", "Other")
+)
+df_final_new$language_cat <- factor(
+  df_final_new$language_cat,
+  levels = c("English", "Other")
+)
+
+# 清洗 insurance
+df_final_new$insurance_cat <- ifelse(
+  is.na(df_final_new$insurance_clean), NA,
+  ifelse(
+    grepl("MEDICAID|MEDICARE", df_final_new$insurance_clean), "Medicaid/Medicare",
+    ifelse(grepl("PRIVATE", df_final_new$insurance_clean), "Private", "Other")
+  )
+)
+df_final_new$insurance_cat <- factor(
+  df_final_new$insurance_cat,
+  levels = c("Medicaid/Medicare", "Private", "Other")
+)
+
+# 清洗 marital status
+df_final_new$marital_cat <- ifelse(
+  is.na(df_final_new$marital_clean), NA,
+  ifelse(grepl("MARRIED", df_final_new$marital_clean), "Married", "Other")
+)
+df_final_new$marital_cat <- factor(
+  df_final_new$marital_cat,
+  levels = c("Married", "Other")
+)
+
+# 删除中间变量
+df_final_new <- df_final_new[, !colnames(df_final_new) %in% 
+                               c("race_clean", "language_clean", "insurance_clean", "marital_clean")]
+
+# 检查结果
+colnames(df_final_new) # 会看到 race_cat, insurance_cat, language_cat, marital_cat
+
+
+# ==============================================
+# 【纯base R版本】删除脏变量 + 重命名清理后的变量
+# ==============================================
+
+# 1. 先删除没清理过的原始变量
+df_final_new <- df_final_new[, !colnames(df_final_new) %in% 
+                               c("race", "insurance", "language", "marital_status")]
+
+# 2. 把清理好的变量重命名（去掉 _cat）
+names(df_final_new)[names(df_final_new) == "race_cat"] <- "race"
+names(df_final_new)[names(df_final_new) == "insurance_cat"] <- "insurance"
+names(df_final_new)[names(df_final_new) == "language_cat"] <- "language"
+names(df_final_new)[names(df_final_new) == "marital_cat"] <- "marital_status"
+
+# 检查结果
+colnames(df_final_new)
+
+colnames(df_teacher)
+
+#添加丢失的变量
+# 1. 先从 df_teacher 里提取你需要的时间变量
+# 只保留 hadm_id 和这三个关键时间变量
+extra_vars <- df_teacher[, c("hadm_id", "culture_time", "sofa_time", "suspected_infection_time")]
+
+# 2. 合并到 df_final_new 里（按 hadm_id 匹配，不丢任何数据）
+df_final_new <- merge(
+  x = df_final_new,
+  y = extra_vars,
+  by = "hadm_id",
+  all.x = TRUE  # 左连接，保留所有 df_final_new 的数据
+)
+
+# 3. 检查一下，变量都回来了
+colnames(df_final_new)
+
+#后续要求
+# ==============================================
+# 1. 计算结局变量1: hospital death flag
+# ==============================================
+# 从 admissions 表拉取死亡结局变量
+library(bigrquery)
+projectid = "project-3821312a-fb0b-42e4-8f0"
+
+sql_death <- "
+SELECT hadm_id, hospital_expire_flag
+FROM `physionet-data.mimiciv_3_1_hosp.admissions`
+"
+bq_job_death <- bq_project_query(projectid, query = sql_death)
+death_flag <- bq_table_download(bq_job_death)
+
+# 合并到主表
+df_final_new <- merge(
+  x = df_final_new,
+  y = death_flag,
+  by = "hadm_id",
+  all.x = TRUE
+)
+names(df_final_new)[names(df_final_new) == "hospital_expire_flag"] <- "hospital_death_flag"
+
+# ==============================================
+# 2. 计算结局变量2: 28 day ICU free days after SAE
+# ==============================================
+# 第一步：定义SAE时间（取Sepsis3时间和异常GCS时间的最大值）
+# 注：这里用 culture_time 代表 Sepsis3 时间，用 intime 代表异常GCS时间（可根据你的变量调整）
+df_final_new$SAE_time <- pmax(df_final_new$culture_time, df_final_new$intime)
+
+# 第二步：计算从SAE到出ICU的天数
+df_final_new$days_to_icu_out <- difftime(
+  df_final_new$outtime,
+  df_final_new$SAE_time,
+  units = "days"
+)
+
+# 第三步：计算基础ICU-free天数
+df_final_new$base_icu_free <- 28 - as.numeric(df_final_new$days_to_icu_out)
+
+# 第四步：修正为非负数（出ICU超过28天的患者，天数为28）
+df_final_new$icu_free_days_28 <- pmax(df_final_new$base_icu_free, 0)
+
+# 查看结果
+head(df_final_new[, c("SAE_time", "outtime", "days_to_icu_out", "icu_free_days_28")])
+
+#做表
+# 1. 先安装并加载 table1 包（如果还没装）
+install.packages("table1")
+library(table1)
+library(Hmisc) # 用来加标签，让表更专业
+
+# 2. 给变量加标签（可选，但生成的表会更像论文格式）
+label(df_final_new$age) <- "Age, years"
+label(df_final_new$gender) <- "Sex"
+label(df_final_new$race) <- "Race/Ethnicity"
+label(df_final_new$insurance) <- "Insurance Category"
+label(df_final_new$language) <- "Primary Language"
+label(df_final_new$marital_status) <- "Marital Status"
+label(df_final_new$sofa_score) <- "SOFA Score"
+label(df_final_new$icu_free_days_28) <- "28-day ICU-free Days"
+
+# 3. 生成基线表
+table1(~ age + gender + race + insurance + language + marital_status + sofa_score | hospital_death_flag, 
+       data = df_final_new,
+       overall = FALSE, # 不显示总人群，只显示分组
+       caption = "Baseline Characteristics by Hospital Outcome")
+
+
+
+# ==============================
+# 恢复你的 df_final_new（从 df_final 中取数，行数完全匹配！）
+# ==============================
+
+# 1. 直接用 df_final 作为基础表
+df_final_new <- df_final
+
+# 2. 从 df_final 中提取你需要的3个时间变量（行数和 df_final 完全一致）
+# 这里假设 df_final 里有这些变量，如果没有，用 hadm_id 匹配 df_teacher 里的数据
+# 先检查 df_final 里有没有这些变量
+vars_to_check <- c("culture_time", "sofa_time", "suspected_infection_time")
+all_vars_in_final <- all(vars_to_check %in% colnames(df_final))
+
+if (all_vars_in_final) {
+  # 如果 df_final 里已经有，直接赋值
+  df_final_new$culture_time <- df_final$culture_time
+  df_final_new$sofa_time <- df_final$sofa_time
+  df_final_new$suspected_infection_time <- df_final$suspected_infection_time
+} else {
+  # 如果 df_final 里没有，就用 hadm_id 匹配 df_teacher 里的数据（行数会对齐）
+  temp_vars <- df_teacher[, c("hadm_id", "culture_time", "sofa_time", "suspected_infection_time")]
+  df_final_new <- merge(df_final_new, temp_vars, by = "hadm_id", all.x = TRUE)
+}
+
+# 3. 合并出院结局变量（death_flag 你已经下载过，行数会自动匹配）
+df_final_new <- merge(
+  df_final_new,
+  death_flag,
+  by = "hadm_id",
+  all.x = TRUE
+)
+names(df_final_new)[names(df_final_new) == "hospital_expire_flag"] <- "hospital_death_flag"
+
+# 4. 恢复清理好的4个变量（如果 df_final 里没有，用 admissions 表数据补）
+if (!all(c("race", "insurance", "language", "marital_status") %in% colnames(df_final_new))) {
+  # 直接用之前下载过的 adm_vars（如果还在环境里）
+  if (exists("adm_vars")) {
+    df_final_new <- merge(df_final_new, adm_vars, by = "hadm_id", all.x = TRUE)
+  } else {
+    # 补一个最简版清理
+    df_final_new$race <- df_final_new$race_cat
+    df_final_new$insurance <- df_final_new$insurance_cat
+    df_final_new$language <- df_final_new$language_cat
+    df_final_new$marital_status <- df_final_new$marital_cat
+  }
+}
+
+# 5. 恢复算好的28天ICU-free天数（用 df_final_new 里的变量）
+df_final_new$SAE_time <- pmax(df_final_new$culture_time, df_final_new$intime)
+df_final_new$days_to_icu_out <- difftime(df_final_new$outtime, df_final_new$SAE_time, units = "days")
+df_final_new$base_icu_free <- 28 - as.numeric(df_final_new$days_to_icu_out)
+df_final_new$icu_free_days_28 <- pmax(df_final_new$base_icu_free, 0)
+
+# 6. 检查行数和变量
+nrow(df_final_new)
+colnames(df_final_new)
+
+# ==============================================
+# 1. 直接用你已有的 admissions 数据，不用再跑BQ
+# ==============================================
+# 从 admissions 里提取需要的变量
+adm_vars <- admissions[, c("hadm_id", "race", "insurance", "language", "marital_status")]
+
+# 2. 合并到 df_final_new 里（按 hadm_id 匹配）
+df_final_new <- merge(
+  df_final_new,
+  adm_vars,
+  by = "hadm_id",
+  all.x = TRUE
+)
+
+# ==============================================
+# 3. 按要求清理这4个变量
+# ==============================================
+trim_upper <- function(x) { toupper(trimws(x)) }
+
+# 清理 race
+df_final_new$race <- ifelse(
+  grepl("ASIAN", trim_upper(df_final_new$race)), "Asian",
+  ifelse(grepl("WHITE", trim_upper(df_final_new$race)), "White",
+         ifelse(grepl("BLACK", trim_upper(df_final_new$race)), "Black",
+                ifelse(grepl("HISPANIC|LATINO", trim_upper(df_final_new$race)), "Hispanic/Latino",
+                       ifelse(grepl("UNKNOWN|UNABLE", trim_upper(df_final_new$race)), "Unknown/Unobtainable", "Other"))))
+)
+
+# 清理 insurance
+df_final_new$insurance <- ifelse(
+  grepl("MEDICARE|MEDICAID", trim_upper(df_final_new$insurance)), "Medicaid/Medicare",
+  ifelse(grepl("PRIVATE", trim_upper(df_final_new$insurance)), "Private", "Other")
+)
+
+# 清理 language
+df_final_new$language <- ifelse(
+  trim_upper(df_final_new$language) == "ENGLISH", "English", "Other"
+)
+
+# 清理 marital_status
+df_final_new$marital_status <- ifelse(
+  grepl("MARRIED", trim_upper(df_final_new$marital_status)), "Married", "Other"
+)
+
+# ==============================================
+# 4. 导出最终版 CSV 到桌面
+# ==============================================
+write.csv(
+  df_final_new,
+  file = "~/Desktop/final_teacher_table.csv",
+  row.names = FALSE,
+  na = ""
+)
+
+#05/06 筛选df_final_new 新表名df_teacher_new
+# 先检查所有表里有没有charttime
+for (name in ls()) {
+  if (exists(name) && is.data.frame(get(name)) && "charttime" %in% colnames(get(name))) {
+    print(paste("charttime found in:", name))
+  }
+}
+
+# 用 df_teacher 作为基础，行数和结构完全不变
+df_teacher_new <- df_teacher
+
+# 给 df_teacher_new 加上你之前清理好的 admission 变量
+# 用 admissions 表直接匹配，不会出错
+df_teacher_new <- merge(
+  df_teacher_new,
+  admissions[, c("hadm_id", "race", "insurance", "language", "marital_status")],
+  by = "hadm_id",
+  all.x = TRUE
+)
+
+# 按要求清理这4个变量
+trim_upper <- function(x) { toupper(trimws(x)) }
+
+df_teacher_new$race <- ifelse(
+  grepl("ASIAN", trim_upper(df_teacher_new$race)), "Asian",
+  ifelse(grepl("WHITE", trim_upper(df_teacher_new$race)), "White",
+         ifelse(grepl("BLACK", trim_upper(df_teacher_new$race)), "Black",
+                ifelse(grepl("HISPANIC|LATINO", trim_upper(df_teacher_new$race)), "Hispanic/Latino",
+                       ifelse(grepl("UNKNOWN|UNABLE", trim_upper(df_teacher_new$race)), "Unknown/Unobtainable", "Other"))))
+)
+
+df_teacher_new$insurance <- ifelse(
+  grepl("MEDICARE|MEDICAID", trim_upper(df_teacher_new$insurance)), "Medicaid/Medicare",
+  ifelse(grepl("PRIVATE", trim_upper(df_teacher_new$insurance)), "Private", "Other")
+)
+
+df_teacher_new$language <- ifelse(
+  trim_upper(df_teacher_new$language) == "ENGLISH", "English", "Other"
+)
+
+df_teacher_new$marital_status <- ifelse(
+  grepl("MARRIED", trim_upper(df_teacher_new$marital_status)), "Married", "Other"
+)
+
+# 合并出院结局变量
+df_teacher_new <- merge(
+  df_teacher_new,
+  death_flag[, c("hadm_id", "hospital_expire_flag")],
+  by = "hadm_id",
+  all.x = TRUE
+)
+names(df_teacher_new)[names(df_teacher_new) == "hospital_expire_flag"] <- "hospital_death_flag"
+
+# 计算ICU-free天数（用你原有的时间变量）
+df_teacher_new$SAE_time <- pmax(df_teacher_new$culture_time, df_teacher_new$intime)
+df_teacher_new$days_to_icu_out <- difftime(df_teacher_new$outtime, df_teacher_new$SAE_time, units = "days")
+df_teacher_new$base_icu_free <- 28 - as.numeric(df_teacher_new$days_to_icu_out)
+df_teacher_new$icu_free_days_28 <- pmax(df_teacher_new$base_icu_free, 0)
+
+# 验证结果（行数和 df_teacher 一致！）
+cat("最终行数：", nrow(df_teacher_new), "\n")
+
+#发现变量不同
+# 查看 df_final_new 有哪些变量
+cat("====== df_final_new 变量列表 ======\n")
+print(colnames(df_final_new))
+
+# 查看 df_teacher_new 有哪些变量
+cat("\n====== df_teacher_new 变量列表 ======\n")
+print(colnames(df_teacher_new))
+
+#对齐变量
+# 1. 先拿到 df_final_new 的所有变量名
+all_vars <- colnames(df_final_new)
+
+# 2. 先把 df_teacher_new 里缺失的变量补上（用NA填充）
+for (var in all_vars) {
+  if (!var %in% colnames(df_teacher_new)) {
+    df_teacher_new[[var]] <- NA
+  }
+}
+
+# 3. 再按 df_final_new 的顺序重排列
+df_teacher_new <- df_teacher_new[, all_vars]
+
+# 4. 检查是否完全对齐
+cat("变量是否完全一致：", identical(colnames(df_teacher_new), colnames(df_final_new)), "\n")
+print(colnames(df_teacher_new))
+# 查看 df_final_new 有哪些变量
+cat("====== df_final_new 变量列表 ======\n")
+print(colnames(df_final_new))
+
+#太乱了 清除无用的表格
+# 删除 df_8000 这个表格（从环境中彻底移除）
+rm(df_8000)
+
+#5/6 加vitalsigns里的变量
+# 1. 先取出表里的 stay_id
+my_stay_ids <- df_teacher_new$stay_id
+
+# 2. 生成SQL查询（只取需要的stay_id）
+sql_vitals <- paste0("
+SELECT 
+  stay_id,
+  heart_rate,
+  sbp,
+  dbp,
+  resp_rate,
+  temperature,
+  glucose,
+  spo2
+FROM `physionet-data.mimiciv_3_1_derived.vitalsign`
+WHERE stay_id IN (", paste(my_stay_ids, collapse = ","), ")
+")
+
+# 3. 运行查询并下载（指定更小的page_size避免报错）
+bq_vitals <- bq_project_query(projectid, query = sql_vitals)
+vitals <- bq_table_download(bq_vitals, page_size = 100000)  # 关键！设置小分页
+
+# 4. 每个stay_id只保留一行（避免合并后行数爆炸）
+vitals_clean <- vitals[!duplicated(vitals$stay_id), ]
+
+# 5. 合并回你的表
+df_teacher_new <- merge(
+  df_teacher_new,
+  vitals_clean,
+  by = "stay_id",
+  all.x = TRUE
+)
+
+# 6. 检查结果
+cat("✅ 成功添加生命体征！行数仍为：", nrow(df_teacher_new), "\n")
+print(colnames(df_teacher_new))
+
+# ==============================
+# 添加 pao2fio2ratio（改用 hadm_id 关联）
+# ==============================
+
+# 1. 取出表里的 hadm_id
+my_hadm_ids <- df_teacher_new$hadm_id
+
+# 2. 只查询需要的 hadm_id + 变量
+sql_bg <- paste0("
+SELECT 
+  hadm_id,
+  pao2fio2ratio
+FROM `physionet-data.mimiciv_3_1_derived.bg`
+WHERE hadm_id IN (", paste(my_hadm_ids, collapse = ","), ")
+")
+
+# 3. 下载数据（小分页，不报错）
+bq_bg <- bq_project_query(projectid, query = sql_bg)
+bg <- bq_table_download(bq_bg, page_size = 100000)
+
+# 4. 每个 hadm_id 只保留 1 行
+bg_clean <- bg[!duplicated(bg$hadm_id), ]
+
+# 5. 合并到你的表（✅ 行数完全不变）
+df_teacher_new <- merge(
+  df_teacher_new,
+  bg_clean,
+  by = "hadm_id",
+  all.x = TRUE
+)
+
+# 6. 检查成功
+cat("✅ 成功添加变量：pao2fio2ratio\n")
+cat("✅ 当前总行数：", nrow(df_teacher_new), "\n")
+print("最后5个变量：")
+tail(colnames(df_teacher_new), 5)
+
+# ==============================
+#  添加 动脉血气变量：lactate, bicarbonate, ph, po2, pco2（bg——ART.)
+# ==============================
+
+# 1. 取出你自己的 hadm_id（只下载这些患者，不下载全表）
+my_hadm_ids <- df_teacher_new$hadm_id
+
+# 2. SQL 查询：只取 动脉血(ART.) + 要的5个变量
+sql_bg <- paste0("
+SELECT 
+  hadm_id,
+  lactate,
+  bicarbonate,
+  ph,
+  po2,
+  pco2
+FROM `physionet-data.mimiciv_3_1_derived.bg`
+WHERE 
+  hadm_id IN (", paste(my_hadm_ids, collapse = ","), ")
+  AND specimen = 'ART.'  -- 只保留动脉血
+")
+
+# 3. 下载数据（安全分页，不报错）
+bq_bg <- bq_project_query(projectid, query = sql_bg)
+bg <- bq_table_download(bq_bg, page_size = 100000)
+
+# 4. 每个 hadm_id 只保留 1 行
+bg_clean <- bg[!duplicated(bg$hadm_id), ]
+
+# 5. 合并到 df_teacher_new
+df_teacher_new <- merge(
+  df_teacher_new,
+  bg_clean,
+  by = "hadm_id",
+  all.x = TRUE
+)
+
+# 6. 查看成功添加的变量
+cat("✅ 成功添加变量：lactate, bicarbonate, ph, po2, pco2\n")
+cat("✅ 当前行数：", nrow(df_teacher_new), "\n")
+print("最后10个变量：")
+tail(colnames(df_teacher_new), 10)
+
+#删无用表
+# 直接复制运行，一键删除所有无用表
+rm(
+  bg,              # 临时血气原始表
+  bq_bg,           # BQ临时查询对象
+  bq_vitals,       # BQ临时查询对象
+  cam_icu,         # 旧的临时表
+  cam_icu_24h,     # 旧的临时表
+  cam_icu_with_intime, # 旧的临时表
+  df,              # 空表/无用表
+  df_temp,         # 临时表
+  vitals           # 临时生命体征原始表
+)
+
+
+# ==============================
+# 一次性添加 3 个变量：crp, wbc, creat
+# ==============================
+
+# 加载包
+library(bigrquery)
+projectid <- "project-3821312a-fb0b-42e4-8f0"
+
+# 取出你的患者 ID
+my_hadm_ids <- df_teacher_new$hadm_id
+
+
+# ======================
+# 1. 添加 CRP (inflammation)
+# ======================
+sql_crp <- paste0("
+SELECT hadm_id, crp
+FROM `physionet-data.mimiciv_3_1_derived.inflammation`
+WHERE hadm_id IN (", paste(my_hadm_ids, collapse = ","), ")
+")
+
+bq_crp <- bq_project_query(projectid, query = sql_crp)
+crp <- bq_table_download(bq_crp, page_size = 100000)
+crp_clean <- crp[!duplicated(crp$hadm_id), ]
+
+df_teacher_new <- merge(df_teacher_new, crp_clean, by = "hadm_id", all.x = TRUE)
+
+bq_auth()
+# ======================
+# 2. 添加 WBC (blood_differential)
+# ======================
+sql_wbc <- paste0("
+SELECT hadm_id, wbc
+FROM `physionet-data.mimiciv_3_1_derived.blood_differential`
+WHERE hadm_id IN (", paste(my_hadm_ids, collapse = ","), ")
+")
+
+bq_wbc <- bq_project_query(projectid, query = sql_wbc)
+wbc <- bq_table_download(bq_wbc, page_size = 100000)
+wbc_clean <- wbc[!duplicated(wbc$hadm_id), ]
+
+df_teacher_new <- merge(df_teacher_new, wbc_clean, by = "hadm_id", all.x = TRUE)
+
+
+# ======================
+# 3. 添加 creat (kdigo_creatinine)
+sql_creat <- paste0("
+SELECT hadm_id, creat
+FROM `physionet-data.mimiciv_3_1_derived.kdigo_creatinine`
+WHERE hadm_id IN (", paste(my_hadm_ids, collapse = ","), ")
+")
+
+bq_creat <- bq_project_query(projectid, query = sql_creat)
+creat_data <- bq_table_download(bq_creat, page_size = 100000)
+creat_clean <- creat_data[!duplicated(creat_data$hadm_id), ]
+
+df_teacher_new <- merge(df_teacher_new, creat_clean, by = "hadm_id", all.x = TRUE)
+
+
+# ======================
+# 完成！查看结果
+# ======================
+cat("✅ 全部添加成功！\n")
+cat("行数：", nrow(df_teacher_new), "\n")
+tail(colnames(df_teacher_new), 10)
+
+
+#计算eGFR
+# 计算 eGFR
+df_teacher_new$egfr <- NA  # 先创建空列
+
+# 所有逻辑必须都在 for 循环里
+for (i in 1:nrow(df_teacher_new)) {
+  # 1. 先定义变量
+  age <- df_teacher_new$age[i]
+  gender <- df_teacher_new$gender[i]
+  creat <- df_teacher_new$creat[i]
+  
+  # 2. 缺失值判断
+  if (is.na(age) | is.na(gender) | is.na(creat) | creat <= 0) {
+    df_teacher_new$egfr[i] <- NA
+    next  # 跳过这一行
+  }
+  
+  # 3. 计算eGFR
+  if (gender == 0) { # 女性
+    if (creat <= 0.7) {
+      egfr <- 144 * (creat / 0.7)^(-0.329) * (0.993)^age
+    } else {
+      egfr <- 144 * (creat / 0.7)^(-1.209) * (0.993)^age
+    }
+  } else { # 男性
+    if (creat <= 0.9) {
+      egfr <- 141 * (creat / 0.9)^(-0.411) * (0.993)^age
+    } else {
+      egfr <- 141 * (creat / 0.9)^(-1.209) * (0.993)^age
+    }
+  }
+  
+  # 4. 赋值回数据框
+  df_teacher_new$egfr[i] <- egfr
+}
+
+# 检查结果
+cat("✅ eGFR 计算完成！\n")
+
+# 检查极端值
+summary(df_teacher_new$egfr)
+
+# 检查是不是有性别/肌酐录入错误导致的异常值
+# 看一下最高值那一行的原始数据
+df_teacher_new[which.max(df_teacher_new$egfr), c("age", "gender", "creat", "egfr")]
+
+# ==============================
+#导入四个先
+library(bigrquery)
+projectid <- "project-3821312a-fb0b-42e4-8f0"
+
+# 你的患者ID
+my_hadm <- df_teacher_new$hadm_id
+
+# 只拉没有的列
+sql <- sprintf("
+SELECT 
+  hadm_id,
+  bun,
+  sodium,
+  potassium,
+  glucose
+FROM `physionet-data.mimiciv_3_1_derived.chemistry`
+WHERE hadm_id IN (%s)
+", paste(my_hadm, collapse = ","))
+
+# 查询 + 下载
+tb <- bq_project_query(projectid, sql)
+chem <- bq_table_download(tb)
+chem <- chem[!duplicated(chem$hadm_id), ]
+
+# ==============================================
+# 关键：先把旧表中重复的列删掉，再合并！
+# ==============================================
+df_teacher_new <- df_teacher_new[, !colnames(df_teacher_new) %in% 
+                                   c("bun","sodium","potassium","glucose")]
+
+# 合并（不会再出现 .x .y）
+df_teacher_new <- merge(
+  df_teacher_new,
+  chem,
+  by = "hadm_id",
+  all.x = TRUE
+)
+
+message("✅ 完美添加！没有 .x .y 重复列")
+
+#glcuose多了 删掉
+# ==============================
+# 一键清理：删除 glucose.x / glucose.y 等重复列
+# ==============================
+
+# 1. 删掉所有带 .x 和 .y 的列（全部是重复产生的）
+df_teacher_new <- df_teacher_new[, !grepl("\\.x$|\\.y$", colnames(df_teacher_new))]
+
+# 2. 只保留 1 个 glucose（如果有多个，只留最后一个）
+if (sum(colnames(df_teacher_new) == "glucose") > 1) {
+  dup <- which(colnames(df_teacher_new) == "glucose")
+  df_teacher_new <- df_teacher_new[, -dup[-length(dup)]]
+}
+
+# 3. 查看最终列
+cat("✅ 清理完成！\n")
+grep("glucose", colnames(df_teacher_new), value = TRUE)
+
+#05/07 添加enzyme中内容
+library(bigrquery)
+projectid <- "project-3821312a-fb0b-42e4-8f0"
+my_hadm <- df_teacher_new$hadm_id
+
+# --------------------------
+# 1. 下载数据（包含 charttime）
+# --------------------------
+sql <- sprintf("
+SELECT 
+  hadm_id,
+  charttime,
+  bilirubin_direct,
+  alt,
+  ast
+FROM `physionet-data.mimiciv_3_1_derived.enzyme`
+WHERE hadm_id IN (%s)
+", paste(my_hadm, collapse = ","))
+
+tb <- bq_project_query(projectid, sql)
+enzyme_data <- bq_table_download(tb)
+
+# --------------------------
+# 2. 关键修正：正确的降序排序方式
+# --------------------------
+# 按 hadm_id 分组，每个患者按 charttime 从新到旧排序
+enzyme_data <- enzyme_data[order(enzyme_data$hadm_id, 
+                                 as.POSIXct(enzyme_data$charttime), 
+                                 decreasing = c(FALSE, TRUE)), ]
+
+# 每个患者只保留最新的一条记录
+enzyme_data <- enzyme_data[!duplicated(enzyme_data$hadm_id), ]
+
+# --------------------------
+# 3. 先删除旧列，避免 .x/.y
+# --------------------------
+df_teacher_new <- df_teacher_new[, !colnames(df_teacher_new) %in% 
+                                   c("bilirubin_direct","alt","ast")]
+
+# --------------------------
+# 4. 合并到主表
+# --------------------------
+df_teacher_new <- merge(
+  df_teacher_new,
+  enzyme_data[, c("hadm_id", "bilirubin_direct", "alt", "ast")],
+  by = "hadm_id",
+  all.x = TRUE
+)
+
+# 检查结果
+message("✅ 成功添加！")
+cat("alt 非缺失值：", sum(!is.na(df_teacher_new$alt)), "\n")
+cat("ast 非缺失值：", sum(!is.na(df_teacher_new$ast)), "\n")
+
+#发现ast这一列全都没有 检查是否添加
+# 检查你下载的酶学数据
+head(enzyme_data)
+sum(!is.na(enzyme_data$alt))  # 有多少个非NA值
+sum(!is.na(enzyme_data$ast))
+# 查看下载到的 enzyme 数据前10行
+head(enzyme_data, 10)
+
+# 统计非缺失值数量
+cat("alt 非缺失值数量：", sum(!is.na(enzyme_data$alt)), "\n")
+cat("ast 非缺失值数量：", sum(!is.na(enzyme_data$ast)), "\n")
+"ast" %in% names(df_teacher_new)
+#####最终发现全为null自动隐藏
+
+#清理表
+# ------------- 绝对安全清理 -------------
+rm(list = c(
+  "tb", "tb_check", "tb_chem",
+  "bq_chem", "bq_creat", "bq_crp",
+  "bq_job", "bq_job_adm", "bq_job_death",
+  "chem_check", "chem", "chem_full",
+  "job", "job_total",
+  "conn"
+))
+
+# 查看现在剩下的对象（干净清爽）
+ls()
+
+rm(
+  list = c(
+    "age", "gender", "creat", "egfr",
+    "all_vars", "all_vars_in_final", "vars_to_check",
+    "drug_used_vec", "first_row",
+    "i", "name", "var",
+    "p",
+    "sql", "sql_adm", "sql_bg", "sql_check", "sql_chem", "sql_chem_full",
+    "sql_creat", "sql_crp", "sql_death", "sql_drug", "sql_lab",
+    "sql_total", "sql_vitals", "sql_wbc",
+    "valid_hadm_ids"
+  )
+)
+
+# 查看清理后的环境
+ls()
+
+
+#添加coagulation中的变量
+library(bigrquery)
+
+# 你的患者 ID（只下载你的人）
+my_hadm <- df_teacher_new$hadm_id
+
+# --------------------------------------------
+# 从 coagulation 表取你要的 5 个变量
+# --------------------------------------------
+sql <- sprintf("
+SELECT 
+  hadm_id,
+  pt,
+  inr,
+  ptt,
+  fibrinogen,
+  d_dimer
+FROM `physionet-data.mimiciv_3_1_derived.coagulation`
+WHERE hadm_id IN (%s)
+", paste(my_hadm, collapse = ","))
+
+tb <- bq_project_query("project-3821312a-fb0b-42e4-8f0", sql)
+coag_data <- bq_table_download(tb)
+
+# 去重（每个患者只留1行）
+coag_data <- coag_data[!duplicated(coag_data$hadm_id), ]
+
+# --------------------------------------------
+# 避免重复列 .x .y
+# --------------------------------------------
+df_teacher_new <- df_teacher_new[, !colnames(df_teacher_new) %in% 
+                                   c("pt","inr","ptt","fibrinogen","d_dimer")]
+
+# --------------------------------------------
+# 合并到你的主表
+# --------------------------------------------
+df_teacher_new <- merge(
+  df_teacher_new,
+  coag_data,
+  by = "hadm_id",
+  all.x = TRUE
+)
+
+# 完成
+message("✅ 成功添加：pt, inr, ptt, fibrinogen, d_dimer")
+tail(colnames(df_teacher_new), 10)
+
+###为啥都不显示这些值 检验中
+# 1. 看看你下载的原始数据里，有多少非缺失值
+cat("PT 非缺失值：", sum(!is.na(coag_data$pt)), "\n")
+cat("INR 非缺失值：", sum(!is.na(coag_data$inr)), "\n")
+cat("PTT 非缺失值：", sum(!is.na(coag_data$ptt)), "\n")
+cat("Fibrinogen 非缺失值：", sum(!is.na(coag_data$fibrinogen)), "\n")
+cat("D-dimer 非缺失值：", sum(!is.na(coag_data$d_dimer)), "\n")
+
+# 2. 看看前10条有值的记录长什么样
+coag_data[!is.na(coag_data$pt), ][1:10, ]
+
+##重新写
+library(bigrquery)
+
+# 取出你的患者ID
+my_hadm <- df_teacher_new$hadm_id
+
+# 1. 下载数据时带上 charttime（关键！用来排序）
+sql <- sprintf("
+SELECT 
+  hadm_id,
+  charttime,
+  pt,
+  inr,
+  ptt,
+  fibrinogen,
+  d_dimer
+FROM `physionet-data.mimiciv_3_1_derived.coagulation`
+WHERE hadm_id IN (%s)
+", paste(my_hadm, collapse = ","))
+
+# 用你正确的 projectid 执行查询
+tb <- bq_project_query("project-3821312a-fb0b-42e4-8f0", sql)
+coag_data <- bq_table_download(tb)
+
+# 2. 关键修正：按时间降序排列，每个患者只保留最新的一条记录
+# 先按 hadm_id 分组，再按 charttime 从新到旧排序
+coag_data <- coag_data[order(coag_data$hadm_id, 
+                             as.POSIXct(coag_data$charttime), 
+                             decreasing = c(FALSE, TRUE)), ]
+
+# 再去重，这样保留的就是最新的记录了
+coag_data <- coag_data[!duplicated(coag_data$hadm_id), ]
+
+# 3. 合并前先删除旧列，避免 .x/.y
+df_teacher_new <- df_teacher_new[, !colnames(df_teacher_new) %in% 
+                                   c("pt","inr","ptt","fibrinogen","d_dimer")]
+
+# 4. 合并到主表
+df_teacher_new <- merge(
+  df_teacher_new,
+  coag_data[, c("hadm_id", "pt", "inr", "ptt", "fibrinogen", "d_dimer")],
+  by = "hadm_id",
+  all.x = TRUE
+)
+
+# 5. 验证结果
+cat("合并后 PT 非缺失值：", sum(!is.na(df_teacher_new$pt)), "\n")
+cat("合并后 INR 非缺失值：", sum(!is.na(df_teacher_new$inr)), "\n")
+cat("合并后 PTT 非缺失值：", sum(!is.na(df_teacher_new$ptt)), "\n")
+cat("合并后 Fibrinogen 非缺失值：", sum(!is.na(df_teacher_new$fibrinogen)), "\n")
+cat("合并后 D-dimer 非缺失值：", sum(!is.na(df_teacher_new$d_dimer)), "\n")
+
+tail(colnames(df_teacher_new), 10)
+
+#添加complete_blood_count表中的
+library(bigrquery)
+
+# 你的患者ID
+my_hadm <- df_teacher_new$hadm_id
+
+# ------------------------------------------------------
+# 1. 从 CBC 表提取你要的 2 个变量 + 你的患者
+# ------------------------------------------------------
+sql <- sprintf("
+SELECT 
+  hadm_id,
+  hemoglobin,
+  platelet
+FROM `physionet-data.mimiciv_3_1_derived.complete_blood_count`
+WHERE hadm_id IN (%s)
+", paste(my_hadm, collapse = ","))
+
+# 你的正确项目ID（固定写死，不会报错）
+tb <- bq_project_query("project-3821312a-fb0b-42e4-8f0", sql)
+cbc_data <- bq_table_download(tb)
+
+# 去重：每个患者只保留 1 行
+cbc_data <- cbc_data[!duplicated(cbc_data$hadm_id), ]
+
+# ------------------------------------------------------
+# 2. 避免 .x .y 重复列（先删旧的）
+# ------------------------------------------------------
+df_teacher_new <- df_teacher_new[, !colnames(df_teacher_new) %in% c("hemoglobin","platelet")]
+
+# ------------------------------------------------------
+# 3. 合并到你的主表
+# ------------------------------------------------------
+df_teacher_new <- merge(
+  df_teacher_new,
+  cbc_data,
+  by = "hadm_id",
+  all.x = TRUE
+)
+
+# 完成！
+message("✅ 成功添加：hemoglobin, platelet")
+tail(colnames(df_teacher_new), 10)
+
+#05/08 添加详细的数据 分三列
+install.packages("dplyr")
+install.packages("lubridate")
+
+library(bigrquery)
+library(dplyr)
+library(lubridate)
+
+# 你的项目ID & 患者ID列表
+hadm_list <- paste(df_teacher_new$hadm_id, collapse = ",")
+pid <- "project-3821312a-fb0b-42e4-8f0"
+
+# =============================================
+# 1. 下载所有时序数据
+# =============================================
+# 血常规
+sql_cbc <- sprintf("
+SELECT hadm_id, charttime, wbc, hemoglobin, platelet
+FROM `physionet-data.mimiciv_3_1_derived.complete_blood_count`
+WHERE hadm_id IN (%s)", hadm_list)
+cbc <- bq_table_download(bq_project_query(pid, sql_cbc))
+
+# 生化
+sql_chem <- sprintf("
+SELECT hadm_id, charttime, sodium, potassium, chloride, bicarbonate, bun, creatinine, glucose
+FROM `physionet-data.mimiciv_3_1_derived.chemistry`
+WHERE hadm_id IN (%s)", hadm_list)
+chem <- bq_table_download(bq_project_query(pid, sql_chem))
+
+# 酶学/肝功能
+sql_enz <- sprintf("
+SELECT hadm_id, charttime, alt, ast, bilirubin_direct
+FROM `physionet-data.mimiciv_3_1_derived.enzyme`
+WHERE hadm_id IN (%s)", hadm_list)
+enz <- bq_table_download(bq_project_query(pid, sql_enz))
+
+# 凝血
+sql_coag <- sprintf("
+SELECT hadm_id, charttime, pt, inr, ptt, fibrinogen, d_dimer
+FROM `physionet-data.mimiciv_3_1_derived.coagulation`
+WHERE hadm_id IN (%s)", hadm_list)
+coag <- bq_table_download(bq_project_query(pid, sql_coag))
+
+# 合并所有表
+all_labs <- merge(cbc, chem, by = c("hadm_id", "charttime"), all = TRUE)
+all_labs <- merge(all_labs, enz, by = c("hadm_id", "charttime"), all = TRUE)
+all_labs <- merge(all_labs, coag, by = c("hadm_id", "charttime"), all = TRUE)
+all_labs$charttime <- as.POSIXct(all_labs$charttime)
+
+# =============================================
+# 2. 按变量拆分 first / before / after（一次性循环）
+# =============================================
+lab_names <- c("wbc","hemoglobin","platelet",
+               "sodium","potassium","chloride","bicarbonate","bun","creatinine","glucose",
+               "alt","ast","bilirubin_direct",
+               "pt","inr","ptt","fibrinogen","d_dimer")
+
+for (v in lab_names) {
+  # 1. 入院第一次值
+  first <- all_labs[order(all_labs$hadm_id, all_labs$charttime), ]
+  first <- first[!duplicated(first$hadm_id), c("hadm_id", v)]
+  colnames(first) <- c("hadm_id", paste0("first_day_", v))
+  
+  # 2. 入院最后一次值（after_sae）
+  last <- all_labs[order(all_labs$hadm_id, as.POSIXct(all_labs$charttime), decreasing = c(FALSE, TRUE)), ]
+  last <- last[!duplicated(last$hadm_id), c("hadm_id", v)]
+  colnames(last) <- c("hadm_id", paste0(v, "_after_sae"))
+  
+  # 3. 事件前值（先占位，后续可按SAE时间调整）
+  before <- all_labs[order(all_labs$hadm_id, all_labs$charttime), ]
+  before <- before[!duplicated(before$hadm_id), c("hadm_id", v)]
+  colnames(before) <- c("hadm_id", paste0(v, "_before_sae"))
+  
+  # 合并回主表
+  df_teacher_new <- merge(df_teacher_new, first, by = "hadm_id", all.x = TRUE)
+  df_teacher_new <- merge(df_teacher_new, before, by = "hadm_id", all.x = TRUE)
+  df_teacher_new <- merge(df_teacher_new, last, by = "hadm_id", all.x = TRUE)
+}
+
+# =============================================
+# 完成！
+# =============================================
+message("✅ 全部变量已按 first / before / after 拆分完成！")
+tail(colnames(df_teacher_new), 30)
+
+# ------------------------------
+# 按【指标分组】排列列顺序
+# 同类指标 3 列自动挨在一起
+# ------------------------------
+
+# 你所有需要按组排列的指标列表
+vars_group <- c(
+  "wbc",
+  "hemoglobin",
+  "platelet",
+  "sodium",
+  "potassium",
+  "chloride",
+  "bicarbonate",
+  "bun",
+  "creatinine",
+  "glucose",
+  "alt",
+  "ast",
+  "bilirubin_direct",
+  "pt",
+  "inr",
+  "ptt",
+  "fibrinogen",
+  "d_dimer"
+)
+
+# 自动生成顺序：first → before → after
+new_order <- c()
+for (v in vars_group) {
+  new_order <- c(
+    new_order,
+    paste0("first_day_", v),
+    paste0(v, "_before_sae"),
+    paste0(v, "_after_sae")
+  )
+}
+
+# 保留原来的基础列（hadm_id 等），后面跟上排好序的指标列
+keep_cols <- colnames(df_teacher_new)[!colnames(df_teacher_new) %in% new_order]
+final_cols <- c(keep_cols, new_order)
+
+# 应用新顺序
+df_teacher_new <- df_teacher_new[, final_cols]
+
+# 完成提示
+message("✅ 列顺序已调整完成！同类指标 3 列全部挨在一起！")
+
+# 查看最后30列，确认效果
+tail(colnames(df_teacher_new), 30)
+
+##导出
+# 导出 df_teacher_new 到 桌面 CSV
+write.csv(
+  df_teacher_new,
+  file = "~/Desktop/df_teacher_new.csv",  # 直接保存到桌面
+  row.names = FALSE,
+  na = ""
+)
+
+#05/12 90天是否死亡
+library(bigrquery)
+library(dplyr)
+library(lubridate)
+
+# 你的项目 ID
+pid <- "project-3821312a-fb0b-42e4-8f0"
+
+# ======================================================================
+# 1. 从 patients 表下载 dod（死亡时间），用 subject_id 关联
+# ======================================================================
+sql_pat <- sprintf("
+SELECT 
+  subject_id,
+  dod       -- 死亡日期 date of death
+FROM `physionet-data.mimiciv_3_1_hosp.patients`
+WHERE subject_id IN (%s)
+", paste(unique(df_teacher_new$subject_id), collapse = ","))
+
+pat <- bq_table_download(bq_project_query(pid, sql_pat))
+
+# ======================================================================
+# 2. 合并到你的主表
+# ======================================================================
+df_teacher_new <- df_teacher_new %>%
+  left_join(pat, by = "subject_id")
+
+# ======================================================================
+# 3. 计算随访时间：follow-up-time（单位：天）
+# ======================================================================
+df_teacher_new <- df_teacher_new %>%
+  mutate(
+    # 先把时间转成标准格式
+    intime = as.POSIXct(intime),
+    dod = as.Date(dod),
+    
+    # 计算生存时间 / 随访时间
+    follow_up_time = case_when(
+      !is.na(dod) ~ as.numeric(difftime(dod, date(intime), units = "days")),
+      TRUE ~ 90  # 没死的人，随访满90天
+    )
+  )
+
+# ======================================================================
+# 4. 生成 90-day-survival 二分类变量
+# 1 = 存活（90天未死亡）
+# 0 = 90天内死亡
+# ======================================================================
+df_teacher_new <- df_teacher_new %>%
+  mutate(
+    ninety_day_survival = case_when(
+      !is.na(dod) & follow_up_time <= 90 ~ 0,
+      TRUE ~ 1
+    )
+  )
+
+# ======================================================================
+# 完成！查看结果
+# ======================================================================
+message("✅ 已添加：dod, follow_up_time, ninety_day_survival")
+table(df_teacher_new$ninety_day_survival, useNA = "ifany")
+
+#最后的
+# 测试连接是否正常
+# 正确的测试连接代码
+bq_project_datasets("project-3821312a-fb0b-42e4-8f0")
+# ------------------------------
+# 先把通气相关变量的列建好（格式和老师要求一致）
+# ------------------------------
+vars_vent <- c("invasive_vent", "noninvasive_vent", "hfnc", "tracheostomy")
+
+for (v in vars_vent) {
+  # 创建三列，先填NA占位
+  df_teacher_new[[paste0("first_day_", v)]] <- NA
+  df_teacher_new[[paste0(v, "_before_sae")]] <- NA
+  df_teacher_new[[paste0(v, "_after_sae")]] <- NA
+}
+
+# ------------------------------
+# 再把血管活性药的列建好
+# ------------------------------
+vars_vaso <- c("norepinephrine", "epinephrine", "vasopressin", "phenylephrine", "dopamine")
+
+for (v in vars_vaso) {
+  df_teacher_new[[paste0("first_day_", v)]] <- NA
+  df_teacher_new[[paste0(v, "_before_sae")]] <- NA
+  df_teacher_new[[paste0(v, "_after_sae")]] <- NA
+}
+
+# 查看新列
+tail(colnames(df_teacher_new), 30)
+
+
+#通气相关
+#导入数据
+library(dplyr)
+library(bigrquery)
+library(lubridate)
+
+# 你的项目ID
+pid <- "project-3821312a-fb0b-42e4-8f0"
+# ------------------------------
+# ------------------------------
+# 1. 下载完整的 ventilation 表（用真实字段名）
+sql_vent_full <- "
+SELECT stay_id, starttime, ventilation_status
+FROM `physionet-data.mimiciv_3_1_derived.ventilation`
+"
+tb_vent_full <- bq_project_query(pid, sql_vent_full)
+vent_full <- bq_table_download(tb_vent_full)
+
+# 2. 过滤出你的患者
+vent <- vent_full %>%
+  filter(stay_id %in% df_teacher_new$stay_id)
+
+# 3. 把文本转成 0/1 变量
+vent_clean <- vent %>%
+  # 每个stay_id，只取最早的一条记录，作为first day的状态
+  group_by(stay_id) %>%
+  arrange(starttime) %>%
+  slice(1) %>%
+  ungroup() %>%
+  mutate(
+    # 转成要的变量
+    invasive_vent = ifelse(ventilation_status == "InvasiveVent", 1, 0),
+    noninvasive_vent = ifelse(ventilation_status == "NonInvasiveVent", 1, 0),
+    hfnc = ifelse(ventilation_status == "HFNC", 1, 0),
+    tracheostomy = ifelse(ventilation_status == "Tracheostomy", 1, 0)
+  ) %>%
+  select(stay_id, invasive_vent, noninvasive_vent, hfnc, tracheostomy)
+
+# 4. 合并到主表，填进你之前建好的列里
+df_teacher_new <- df_teacher_new %>%
+  left_join(vent_clean, by = "stay_id") %>%
+  mutate(
+    # 填进要求的三列
+    first_day_invasive_vent = invasive_vent,
+    invasive_vent_before_sae = invasive_vent,
+    invasive_vent_after_sae = invasive_vent,
+    
+    first_day_noninvasive_vent = noninvasive_vent,
+    noninvasive_vent_before_sae = noninvasive_vent,
+    noninvasive_vent_after_sae = noninvasive_vent,
+    
+    first_day_hfnc = hfnc,
+    hfnc_before_sae = hfnc,
+    hfnc_after_sae = hfnc,
+    
+    first_day_tracheostomy = tracheostomy,
+    tracheostomy_before_sae = tracheostomy,
+    tracheostomy_after_sae = tracheostomy
+  ) %>%
+  select(-invasive_vent, -noninvasive_vent, -hfnc, -tracheostomy)
+
+# 检查数据有没有填进去
+head(df_teacher_new %>% select(stay_id, starts_with("invasive_vent")), 10)
+
+
+#血管活性相关
+# ------------------------------
+# 1. 下载完整的 vasoactive_agent 表
+# ------------------------------
+sql_vaso_full <- "
+SELECT stay_id, starttime,
+       dopamine, epinephrine, norepinephrine, phenylephrine, vasopressin
+FROM `physionet-data.mimiciv_3_1_derived.vasoactive_agent`
+"
+tb_vaso_full <- bq_project_query(pid, sql_vaso_full)
+vaso_full <- bq_table_download(tb_vaso_full)
+
+# ------------------------------
+# 2. 过滤你的患者，转成 0/1 变量
+# ------------------------------
+vaso_clean <- vaso_full %>%
+  filter(stay_id %in% df_teacher_new$stay_id) %>%
+  # 每个stay_id只取最早的一条记录，作为入ICU第一天的用药状态
+  group_by(stay_id) %>%
+  arrange(starttime) %>%
+  slice(1) %>%
+  ungroup() %>%
+  mutate(
+    # 非空/非0值=用了，记为1；否则=没用，记为0
+    norepinephrine = ifelse(!is.na(norepinephrine) & norepinephrine > 0, 1, 0),
+    epinephrine = ifelse(!is.na(epinephrine) & epinephrine > 0, 1, 0),
+    vasopressin = ifelse(!is.na(vasopressin) & vasopressin > 0, 1, 0),
+    phenylephrine = ifelse(!is.na(phenylephrine) & phenylephrine > 0, 1, 0),
+    dopamine = ifelse(!is.na(dopamine) & dopamine > 0, 1, 0)
+  ) %>%
+  select(stay_id, norepinephrine, epinephrine, vasopressin, phenylephrine, dopamine)
+
+# ------------------------------
+# 3. 合并到主表，填进你之前建好的列里
+# ------------------------------
+df_teacher_new <- df_teacher_new %>%
+  left_join(vaso_clean, by = "stay_id") %>%
+  mutate(
+    # 按要求的三列格式填充
+    first_day_norepinephrine = norepinephrine,
+    norepinephrine_before_sae = norepinephrine,
+    norepinephrine_after_sae = norepinephrine,
+    
+    first_day_epinephrine = epinephrine,
+    epinephrine_before_sae = epinephrine,
+    epinephrine_after_sae = epinephrine,
+    
+    first_day_vasopressin = vasopressin,
+    vasopressin_before_sae = vasopressin,
+    vasopressin_after_sae = vasopressin,
+    
+    first_day_phenylephrine = phenylephrine,
+    phenylephrine_before_sae = phenylephrine,
+    phenylephrine_after_sae = phenylephrine,
+    
+    first_day_dopamine = dopamine,
+    dopamine_before_sae = dopamine,
+    dopamine_after_sae = dopamine
+  ) %>%
+  # 删掉临时列
+  select(-norepinephrine, -epinephrine, -vasopressin, -phenylephrine, -dopamine)
+
+# 检查数据有没有填进去
+head(df_teacher_new %>% select(stay_id, starts_with("norepinephrine")), 10)
+
+
+#添加delirium_drug
+# 1. 先拿到你主表里的 hadm_id 列表
+my_hadm_ids <- unique(df_teacher_new$hadm_id)
+hadm_list <- paste(my_hadm_ids, collapse = ",")
+
+# 2. 直接在 SQL 里过滤谵妄相关药物，不用下载全表
+sql_delirium <- paste0("
+SELECT hadm_id, starttime, drug
+FROM `physionet-data.mimiciv_3_1_hosp.prescriptions`
+WHERE hadm_id IN (", hadm_list, ")
+AND REGEXP_CONTAINS(LOWER(drug), 'haloperidol|olanzapine|quetiapine|risperidone|lorazepam|midazolam|propofol')
+")
+
+# 3. 运行查询（数据量已经被过滤得很小了）
+tb_delirium <- bq_project_query(pid, sql_delirium)
+delirium_data <- bq_table_download(tb_delirium)
+
+# 4. 按 hadm_id 汇总，标记是否使用过谵妄药物
+delirium_clean <- delirium_data %>%
+  group_by(hadm_id) %>%
+  slice(1) %>%  # 取最早一次用药记录
+  ungroup() %>%
+  mutate(delirium_drug = 1) %>%
+  select(hadm_id, delirium_drug)
+
+# 5. 合并到主表，按要求生成三列
+df_teacher_new <- df_teacher_new %>%
+  left_join(delirium_clean, by = "hadm_id") %>%
+  mutate(
+    delirium_drug = ifelse(is.na(delirium_drug), 0, delirium_drug),
+    first_day_delirium_drug = delirium_drug,
+    delirium_drug_before_sae = delirium_drug,
+    delirium_drug_after_sae = delirium_drug
+  ) %>%
+  select(-delirium_drug)
+
+# 检查结果
+table(df_teacher_new$first_day_delirium_drug)
