@@ -1,0 +1,439 @@
+最新修改版 導出文件為df_teacher_new2.1 僅從源頭整理代碼 與第一版（2.0）數據無差別
+# ==============================================
+# 0. 初始化环境
+# ==============================================
+install.packages(c("bigrquery", "dplyr", "lubridate", "table1"))
+library(bigrquery)
+library(dplyr)
+library(lubridate)
+bq_auth()
+
+# 你的项目ID
+projectid <- "project-3821312a-fb0b-42e4-8f0"
+
+# ==============================================
+# 1. 拉取主队列
+# ==============================================
+sql_main <- "
+WITH base_icu AS (
+  -- 每个患者首次ICU入院
+  SELECT
+    subject_id,
+    stay_id,
+    hadm_id,
+    intime,
+    outtime,
+    DATETIME_DIFF(outtime, intime, HOUR) AS icu_length_hours
+  FROM `physionet-data.mimiciv_3_1_icu.icustays`
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY subject_id ORDER BY intime ASC) = 1
+),
+valid_icu AS (
+  -- ICU住院≥24小时
+  SELECT * FROM base_icu WHERE icu_length_hours >= 24
+),
+first_day_gcs AS (
+  SELECT
+    g.subject_id,
+    g.stay_id,
+    MIN(g.gcs) AS first_day_gcs
+  FROM `physionet-data.mimiciv_3_1_derived.gcs` g
+  JOIN base_icu b ON g.stay_id = b.stay_id
+  WHERE 
+    g.charttime <= DATETIME_ADD(b.intime, INTERVAL 24 HOUR)
+  GROUP BY g.subject_id, g.stay_id
+),
+adult_patients AS (
+  SELECT
+    v.*,
+    a.age,
+    p.gender
+  FROM valid_icu v
+  JOIN `physionet-data.mimiciv_3_1_derived.age` a ON v.hadm_id = a.hadm_id
+  JOIN `physionet-data.mimiciv_3_1_hosp.patients` p ON v.subject_id = p.subject_id
+  WHERE a.age >= 18
+),
+final_cohort AS (
+  SELECT DISTINCT
+    a.*,
+    s.sofa_score,
+    s.sepsis3,
+    s.culture_time,
+    s.sofa_time,
+    s.suspected_infection_time,
+    g.first_day_gcs,
+
+    -- sepsis3 在 24h 内
+    IF(
+      DATETIME_DIFF(
+        GREATEST(s.culture_time, s.sofa_time),
+        a.intime,
+        HOUR
+      ) < 24, 1, 0
+    ) AS sepsis3_firstday,
+
+    -- normal_GCS：GCS=15 =1，否则=0，NULL也算15
+    IF(IFNULL(g.first_day_gcs, 15) = 15, 1, 0) AS normal_GCS
+
+  FROM adult_patients a
+  LEFT JOIN `physionet-data.mimiciv_3_1_derived.sepsis3` s ON a.stay_id = s.stay_id
+  LEFT JOIN first_day_gcs g ON a.stay_id = g.stay_id
+)
+SELECT * FROM final_cohort;
+"
+
+df <- bq_table_download(bq_project_query(projectid, sql_main), page_size = 100000)
+
+# ==============================================
+# 2. 合并本地文件：CAM-ICU + 谵妄药物
+# ==============================================
+cam_icu <- read.csv("~/Desktop/cam_icu.csv", stringsAsFactors = FALSE)
+delirium_drug <- read.csv("~/Desktop/delirium_drug.csv", stringsAsFactors = FALSE)
+
+# 谵妄药物使用标记
+drug_use <- delirium_drug %>%
+  group_by(stay_id) %>%
+  summarise(drug_used = ifelse(any(delirium_drug_rate > 0, na.rm = TRUE), 1, 0))
+
+# CAM-ICU 24h内最早记录
+cam_clean <- cam_icu %>%
+  left_join(df[, c("stay_id", "intime")], by = "stay_id") %>%
+  filter(charttime <= intime + 24 * 3600) %>%
+  arrange(stay_id, charttime) %>%
+  distinct(stay_id, .keep_all = TRUE) %>%
+  select(stay_id, cam_icu = cam_icu_derived)
+
+# 合并到主表
+df_final <- df %>%
+  mutate(
+    first_day_drug_used = coalesce(drug_use$drug_used[match(stay_id, drug_use$stay_id)], 0),
+    first_day_cam_icu = cam_clean$cam_icu[match(stay_id, cam_clean$stay_id)],
+    first_day_cam_icu = case_when(
+      first_day_cam_icu == "Positive" ~ 1,
+      first_day_cam_icu == "Negative" ~ 0
+    )
+  )
+
+# ==============================================
+# 3. 筛选老师要求的队列：sepsis3 + GCS异常
+# ==============================================
+df_teacher <- df_final %>%
+  filter(sepsis3 == TRUE, normal_GCS == 0)
+
+# ==============================================
+# 4. 批量拉取实验室 + 生命体征（只拉需要的患者）
+# ==============================================
+h <- unique(df_teacher$hadm_id)
+s <- unique(df_teacher$stay_id)
+
+# 生命体征
+sql_vital <- sprintf("
+  SELECT stay_id, heart_rate, sbp, dbp, resp_rate, temperature, glucose, spo2
+  FROM `physionet-data.mimiciv_3_1_derived.vitalsign`
+  WHERE stay_id IN (%s)
+", paste(s, collapse = ","))
+vitals <- bq_table_download(bq_project_query(projectid, sql_vital), page_size = 100000) %>%
+  distinct(stay_id, .keep_all = TRUE)
+
+# 血气
+sql_bg <- sprintf("
+  SELECT hadm_id, pao2fio2ratio, lactate, bicarbonate, ph, po2, pco2
+  FROM `physionet-data.mimiciv_3_1_derived.bg`
+  WHERE specimen = 'ART.' AND hadm_id IN (%s)
+", paste(h, collapse = ","))
+bg <- bq_table_download(bq_project_query(projectid, sql_bg), page_size = 100000) %>%
+  distinct(hadm_id, .keep_all = TRUE)
+
+# 炎症
+sql_inf <- sprintf("SELECT hadm_id, crp FROM `physionet-data.mimiciv_3_1_derived.inflammation` WHERE hadm_id IN (%s)", paste(h, collapse = ","))
+inflammation <- bq_table_download(bq_project_query(projectid, sql_inf), page_size = 100000) %>% distinct(hadm_id, .keep_all = TRUE)
+
+# 血常规
+sql_wbc <- sprintf("SELECT hadm_id, wbc FROM `physionet-data.mimiciv_3_1_derived.blood_differential` WHERE hadm_id IN (%s)", paste(h, collapse = ","))
+wbc <- bq_table_download(bq_project_query(projectid, sql_wbc), page_size = 100000) %>% distinct(hadm_id, .keep_all = TRUE)
+
+# 生化
+sql_chem <- sprintf("SELECT hadm_id, bun, sodium, potassium, glucose FROM `physionet-data.mimiciv_3_1_derived.chemistry` WHERE hadm_id IN (%s)", paste(h, collapse = ","))
+chem <- bq_table_download(bq_project_query(projectid, sql_chem), page_size = 100000) %>% distinct(hadm_id, .keep_all = TRUE)
+
+# 酶学
+sql_enz <- sprintf("SELECT hadm_id, bilirubin_direct, alt, ast FROM `physionet-data.mimiciv_3_1_derived.enzyme` WHERE hadm_id IN (%s)", paste(h, collapse = ","))
+enzyme <- bq_table_download(bq_project_query(projectid, sql_enz), page_size = 100000) %>% distinct(hadm_id, .keep_all = TRUE)
+
+# 凝血
+sql_coag <- sprintf("SELECT hadm_id, pt, inr, ptt, fibrinogen, d_dimer FROM `physionet-data.mimiciv_3_1_derived.coagulation` WHERE hadm_id IN (%s)", paste(h, collapse = ","))
+coag <- bq_table_download(bq_project_query(projectid, sql_coag), page_size = 100000) %>% distinct(hadm_id, .keep_all = TRUE)
+
+# CBC
+sql_cbc <- sprintf("SELECT hadm_id, hemoglobin, platelet FROM `physionet-data.mimiciv_3_1_derived.complete_blood_count` WHERE hadm_id IN (%s)", paste(h, collapse = ","))
+cbc <- bq_table_download(bq_project_query(projectid, sql_cbc), page_size = 100000) %>% distinct(hadm_id, .keep_all = TRUE)
+
+# 肌酐
+sql_creat <- sprintf("SELECT hadm_id, creat FROM `physionet-data.mimiciv_3_1_derived.kdigo_creatinine` WHERE hadm_id IN (%s)", paste(h, collapse = ","))
+creat <- bq_table_download(bq_project_query(projectid, sql_creat), page_size = 100000) %>% distinct(hadm_id, .keep_all = TRUE)
+
+# 合并基础实验室数据
+df_teacher_new <- df_teacher %>%
+  left_join(vitals, by = "stay_id") %>%
+  left_join(bg, by = "hadm_id") %>%
+  left_join(inflammation, by = "hadm_id") %>%
+  left_join(wbc, by = "hadm_id") %>%
+  left_join(chem, by = "hadm_id") %>%
+  left_join(enzyme, by = "hadm_id") %>%
+  left_join(coag, by = "hadm_id") %>%
+  left_join(cbc, by = "hadm_id") %>%
+  left_join(creat, by = "hadm_id")
+
+df_teacher_new <- df_teacher_new %>% rename(creatinine = creat)
+
+# ==============================================
+# ==============================================
+# 5. 拉取 admissions 并清洗社会人口学变量
+# ==============================================
+sql_adm <- sprintf("
+  SELECT hadm_id, race, insurance, language, marital_status, admission_type
+  FROM `physionet-data.mimiciv_3_1_hosp.admissions`
+  WHERE hadm_id IN (%s)
+", paste(h, collapse = ","))
+admissions <- bq_table_download(bq_project_query(projectid, sql_adm), page_size = 100000)
+
+trim_upper <- function(x) toupper(trimws(x))
+df_teacher_new <- df_teacher_new %>%
+  left_join(admissions, by = "hadm_id") %>%
+  mutate(
+    race = case_when(
+      grepl("^ASIAN", trim_upper(race)) ~ "Asian",
+      grepl("^WHITE|PORTUGUESE", trim_upper(race)) ~ "White",
+      grepl("^BLACK", trim_upper(race)) ~ "Black",
+      grepl("HISPANIC|LATINO|SOUTH AMERICAN", trim_upper(race)) ~ "Hispanic/Latino",
+      trim_upper(race) %in% c("UNKNOWN", "UNABLE TO OBTAIN") ~ "Unknown/Unable to Obtain",
+      TRUE ~ "Other"
+    ),
+    language = ifelse(trim_upper(language) == "ENGLISH", "English", "Other"),
+    insurance = case_when(
+      grepl("MEDICAID|MEDICARE", trim_upper(insurance)) ~ "Medicaid/Medicare",
+      grepl("PRIVATE", trim_upper(insurance)) ~ "Private",
+      TRUE ~ "Other"
+    ),
+    marital_status = ifelse(grepl("MARRIED", trim_upper(marital_status)), "Married", "Other")
+  )
+
+# ==============================================
+# 6. 计算结局变量
+# ==============================================
+# 院内死亡
+sql_death <- sprintf("
+  SELECT hadm_id, hospital_expire_flag
+  FROM `physionet-data.mimiciv_3_1_hosp.admissions`
+  WHERE hadm_id IN (%s)
+", paste(h, collapse = ","))
+death_flag <- bq_table_download(bq_project_query(projectid, sql_death), page_size = 100000)
+df_teacher_new <- df_teacher_new %>%
+  left_join(death_flag, by = "hadm_id") %>%
+  rename(hospital_death_flag = hospital_expire_flag)
+
+# 28天ICU-free天数
+df_teacher_new <- df_teacher_new %>%
+  mutate(
+    SAE_time = pmax(culture_time, intime, na.rm = TRUE),
+    days_to_icu_out = as.numeric(difftime(outtime, SAE_time, units = "days")),
+    base_icu_free = 28 - days_to_icu_out,
+    icu_free_days_28 = pmax(base_icu_free, 0)
+  )
+
+# eGFR计算
+df_teacher_new$egfr <- NA
+for (i in 1:nrow(df_teacher_new)) {
+  age <- df_teacher_new$age[i]
+  gender <- df_teacher_new$gender[i]
+  creatinine <- df_teacher_new$creatinine[i]
+  
+  if (is.na(age) | is.na(gender) | is.na(creatinine) | creatinine <= 0) next
+  
+  if (gender == 0) {
+    df_teacher_new$egfr[i] <- ifelse(creatinine <= 0.7,
+                                     144*(creatinine/0.7)^-0.329*0.993^age,
+                                     144*(creatinine/0.7)^-1.209*0.993^age)
+  } else {
+    df_teacher_new$egfr[i] <- ifelse(creatinine <= 0.9,
+                                     141*(creatinine/0.9)^-0.411*0.993^age,
+                                     141*(creatinine/0.9)^-1.209*0.993^age)
+  }
+}
+
+# 90天生存
+sql_pat <- sprintf("
+  SELECT subject_id, dod
+  FROM `physionet-data.mimiciv_3_1_hosp.patients`
+  WHERE subject_id IN (%s)
+", paste(unique(df_teacher_new$subject_id), collapse = ","))
+pat <- bq_table_download(bq_project_query(projectid, sql_pat), page_size = 100000)
+df_teacher_new <- df_teacher_new %>%
+  left_join(pat, by = "subject_id") %>%
+  mutate(
+    intime = as.POSIXct(intime),
+    dod = as.Date(dod),
+    follow_up_time = ifelse(!is.na(dod), as.numeric(difftime(dod, date(intime), "days")), 90),
+    ninety_day_survival = ifelse(!is.na(dod) & follow_up_time <= 90, 0, 1)
+  )
+
+# ==============================================
+# ==============================================
+# 7. 按 first/before/after 拆分实验室指标
+# ==============================================
+# 下载时序实验室数据
+sql_cbc_ts <- sprintf("
+  SELECT hadm_id, charttime, wbc, hemoglobin, platelet
+  FROM `physionet-data.mimiciv_3_1_derived.complete_blood_count`
+  WHERE hadm_id IN (%s)
+", paste(h, collapse = ","))
+cbc_ts <- bq_table_download(bq_project_query(projectid, sql_cbc_ts), page_size = 100000)
+
+sql_chem_ts <- sprintf("
+  SELECT hadm_id, charttime, sodium, potassium, chloride, bicarbonate, bun, creatinine, glucose
+  FROM `physionet-data.mimiciv_3_1_derived.chemistry`
+  WHERE hadm_id IN (%s)
+", paste(h, collapse = ","))
+chem_ts <- bq_table_download(bq_project_query(projectid, sql_chem_ts), page_size = 100000)
+
+sql_enz_ts <- sprintf("
+  SELECT hadm_id, charttime, alt, ast, bilirubin_direct
+  FROM `physionet-data.mimiciv_3_1_derived.enzyme`
+  WHERE hadm_id IN (%s)
+", paste(h, collapse = ","))
+enz_ts <- bq_table_download(bq_project_query(projectid, sql_enz_ts), page_size = 100000)
+
+sql_coag_ts <- sprintf("
+  SELECT hadm_id, charttime, pt, inr, ptt, fibrinogen, d_dimer
+  FROM `physionet-data.mimiciv_3_1_derived.coagulation`
+  WHERE hadm_id IN (%s)
+", paste(h, collapse = ","))
+coag_ts <- bq_table_download(bq_project_query(projectid, sql_coag_ts), page_size = 100000)
+
+# 合并所有时序表
+all_labs <- merge(cbc_ts, chem_ts, by = c("hadm_id", "charttime"), all = TRUE)
+all_labs <- merge(all_labs, enz_ts, by = c("hadm_id", "charttime"), all = TRUE)
+all_labs <- merge(all_labs, coag_ts, by = c("hadm_id", "charttime"), all = TRUE)
+all_labs$charttime <- as.POSIXct(all_labs$charttime)
+
+# 循环拆分 first / before / after
+lab_names <- c("wbc","hemoglobin","platelet",
+               "sodium","potassium","chloride","bicarbonate","bun","creatinine","glucose",
+               "alt","ast","bilirubin_direct",
+               "pt","inr","ptt","fibrinogen","d_dimer")
+
+for (v in lab_names) {
+  # 1. 入院第一次值
+  first <- all_labs[order(all_labs$hadm_id, all_labs$charttime), ]
+  first <- first[!duplicated(first$hadm_id), c("hadm_id", v)]
+  colnames(first) <- c("hadm_id", paste0("first_day_", v))
+  
+  # 2. 入院最后一次值（after_sae）
+  last <- all_labs[order(all_labs$hadm_id, as.POSIXct(all_labs$charttime), decreasing = c(FALSE, TRUE)), ]
+  last <- last[!duplicated(last$hadm_id), c("hadm_id", v)]
+  colnames(last) <- c("hadm_id", paste0(v, "_after_sae"))
+  
+  # 3. 事件前值（先取第一次值占位，后续可按SAE时间调整）
+  before <- all_labs[order(all_labs$hadm_id, all_labs$charttime), ]
+  before <- before[!duplicated(before$hadm_id), c("hadm_id", v)]
+  colnames(before) <- c("hadm_id", paste0(v, "_before_sae"))
+  
+  # 合并回主表
+  df_teacher_new <- merge(df_teacher_new, first, by = "hadm_id", all.x = TRUE)
+  df_teacher_new <- merge(df_teacher_new, before, by = "hadm_id", all.x = TRUE)
+  df_teacher_new <- merge(df_teacher_new, last, by = "hadm_id", all.x = TRUE)
+}
+
+# ==============================================
+# ==============================================
+# 8. 合并通气/血管活性药/谵妄药物变量
+# ==============================================
+# 通气
+sql_vent <- sprintf("
+  SELECT stay_id, starttime, ventilation_status
+  FROM `physionet-data.mimiciv_3_1_derived.ventilation`
+  WHERE stay_id IN (%s)
+", paste(s, collapse = ","))
+vent <- bq_table_download(bq_project_query(projectid, sql_vent), page_size = 100000) %>%
+  group_by(stay_id) %>% arrange(starttime) %>% slice(1) %>% ungroup() %>%
+  mutate(
+    invasive_vent = as.integer(ventilation_status == "InvasiveVent"),
+    noninvasive_vent = as.integer(ventilation_status == "NonInvasiveVent"),
+    hfnc = as.integer(ventilation_status == "HFNC"),
+    tracheostomy = as.integer(ventilation_status == "Tracheostomy")
+  ) %>%
+  select(stay_id, ventilation_status, invasive_vent, noninvasive_vent, hfnc, tracheostomy) # 保留 ventilation_status
+
+# 血管活性药
+sql_vaso <- sprintf("
+  SELECT stay_id, starttime, norepinephrine, epinephrine, vasopressin, phenylephrine, dopamine
+  FROM `physionet-data.mimiciv_3_1_derived.vasoactive_agent`
+  WHERE stay_id IN (%s)
+", paste(s, collapse = ","))
+vaso <- bq_table_download(bq_project_query(projectid, sql_vaso), page_size = 100000) %>%
+  group_by(stay_id) %>% arrange(starttime) %>% slice(1) %>% ungroup() %>%
+  mutate(across(c(norepinephrine, epinephrine, vasopressin, phenylephrine, dopamine), ~as.integer(!is.na(.) & . > 0))) %>%
+  select(stay_id, norepinephrine, epinephrine, vasopressin, phenylephrine, dopamine)
+
+# 谵妄药物
+sql_delirium <- sprintf("
+  SELECT hadm_id FROM `physionet-data.mimiciv_3_1_hosp.prescriptions`
+  WHERE hadm_id IN (%s) AND REGEXP_CONTAINS(LOWER(drug), 'haloperidol|olanzapine|quetiapine|risperidone|lorazepam|midazolam|propofol')
+", paste(h, collapse = ","))
+delirium <- bq_table_download(bq_project_query(projectid, sql_delirium), page_size = 100000) %>%
+  distinct(hadm_id) %>% mutate(delirium_drug = 1)
+
+# 合并并生成三列
+df_teacher_new <- df_teacher_new %>%
+  left_join(vent, by = "stay_id") %>%
+  left_join(vaso, by = "stay_id") %>%
+  left_join(delirium, by = "hadm_id") %>%
+  mutate(
+    delirium_drug = coalesce(delirium_drug, 0),
+    # 通气三列
+    first_day_invasive_vent = invasive_vent,
+    invasive_vent_before_sae = invasive_vent,
+    invasive_vent_after_sae = invasive_vent,
+    first_day_noninvasive_vent = noninvasive_vent,
+    noninvasive_vent_before_sae = noninvasive_vent,
+    noninvasive_vent_after_sae = noninvasive_vent,
+    first_day_hfnc = hfnc,
+    hfnc_before_sae = hfnc,
+    hfnc_after_sae = hfnc,
+    first_day_tracheostomy = tracheostomy,
+    tracheostomy_before_sae = tracheostomy,
+    tracheostomy_after_sae = tracheostomy,
+    # 血管活性药三列
+    first_day_norepinephrine = norepinephrine,
+    norepinephrine_before_sae = norepinephrine,
+    norepinephrine_after_sae = norepinephrine,
+    first_day_epinephrine = epinephrine,
+    epinephrine_before_sae = epinephrine,
+    epinephrine_after_sae = epinephrine,
+    first_day_vasopressin = vasopressin,
+    vasopressin_before_sae = vasopressin,
+    vasopressin_after_sae = vasopressin,
+    first_day_phenylephrine = phenylephrine,
+    phenylephrine_before_sae = phenylephrine,
+    phenylephrine_after_sae = phenylephrine,
+    first_day_dopamine = dopamine,
+    dopamine_before_sae = dopamine,
+    dopamine_after_sae = dopamine,
+    # 谵妄药物三列
+    first_day_delirium_drug = delirium_drug,
+    delirium_drug_before_sae = delirium_drug,
+    delirium_drug_after_sae = delirium_drug
+  ) %>%
+  select(-c(invasive_vent, noninvasive_vent, hfnc, tracheostomy,
+            norepinephrine, epinephrine, vasopressin, phenylephrine, dopamine, delirium_drug))
+
+# ==============================================
+# 9. 清理重复列 + 导出最终数据
+# ==============================================
+# 清理重复的glucose列
+df_teacher_new <- df_teacher_new[, !grepl("glucose\\.x|glucose\\.y", colnames(df_teacher_new))]
+
+#查看有什么列
+# 查看所有列名
+names(df_teacher_new)
+# 导出
+write.csv(df_teacher_new, "~/Desktop/df_teacher_new2.1.csv", row.names = FALSE, na = "")
