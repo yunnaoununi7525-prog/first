@@ -1,3 +1,4 @@
+此為最初版代碼 未進行修改 內容較為雜亂 導出文件為df_teacher_2.0
 install.packages("bigrquery")
 library(bigrquery)
 bq_auth()
