@@ -1,0 +1,213 @@
+---
+title: "SAE_Analysis"
+output: html_document
+date: "2026-05-28"
+---
+
+```{r setup, include=FALSE}
+# Show code by default in R Markdown output.
+knitr::opts_chunk$set(echo = TRUE)
+
+# Core data manipulation and reshaping packages.
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(data.table)
+
+# File input and output packages.
+library(readxl)
+library(gdata)
+library(writexl)
+
+# Date and clinical analysis packages.
+library(lubridate)
+library(comorbidity)
+library(table1)
+
+# BigQuery and database connection packages.
+library(bigrquery)
+library(DBI)
+library(dbplyr)
+
+# Modeling, reporting, and plot-composition packages.
+library(broom)
+library(patchwork)
+library(mice)
+```
+
+
+```{r,echo=F}
+# Load the SAE analysis dataset from the local CSV file.
+data = fread("df_sae.csv")
+```
+
+## Data completeness for candidate risk factors
+
+```{r data-completeness, warning=FALSE, message=FALSE}
+# List the candidate risk-factor variables to check before modeling hospital death.
+candidate_risk_factors = c(
+  # Demographic and admission characteristics.
+  "race", "insurance", "language", "marital_status", "gender_f",
+
+  # Laboratory values around SAE.
+  "first_day_wbc", "wbc_before_sae", "wbc_after_sae",
+  "first_day_hemoglobin", "hemoglobin_before_sae", "hemoglobin_after_sae",
+  "first_day_platelet", "platelet_before_sae", "platelet_after_sae",
+  "first_day_sodium", "sodium_before_sae", "sodium_after_sae",
+  "first_day_potassium", "potassium_before_sae", "potassium_after_sae",
+  "first_day_chloride", "chloride_before_sae", "chloride_after_sae",
+  "first_day_bicarbonate", "bicarbonate_before_sae", "bicarbonate_after_sae",
+  "first_day_bun", "bun_before_sae", "bun_after_sae",
+  "first_day_creatinine", "creatinine_before_sae", "creatinine_after_sae",
+  "first_day_glucose", "glucose_before_sae", "glucose_after_sae",
+  "first_day_alt", "alt_before_sae", "alt_after_sae",
+  "first_day_ast", "ast_before_sae", "ast_after_sae",
+  "first_day_bilirubin_direct", "bilirubin_direct_before_sae",
+  "bilirubin_direct_after_sae", "first_day_pt", "pt_before_sae", "pt_after_sae",
+  "first_day_inr", "inr_before_sae", "inr_after_sae",
+  "first_day_ptt", "ptt_before_sae", "ptt_after_sae",
+  "first_day_fibrinogen", "fibrinogen_before_sae", "fibrinogen_after_sae",
+  "first_day_d_dimer", "d_dimer_before_sae", "d_dimer_after_sae",
+
+  # Respiratory support and treatment indicators around SAE.
+  "first_day_invasive_vent", "invasive_vent_before_sae", "invasive_vent_after_sae",
+  "first_day_noninvasive_vent", "noninvasive_vent_before_sae",
+  "noninvasive_vent_after_sae", "first_day_hfnc", "hfnc_before_sae",
+  "hfnc_after_sae", "first_day_norepinephrine", "norepinephrine_before_sae",
+  "norepinephrine_after_sae", "first_day_epinephrine", "epinephrine_before_sae",
+  "epinephrine_after_sae", "first_day_delirium_drug", "delirium_drug_before_sae",
+  "delirium_drug_after_sae", "first_day_tracheostomy", "tracheostomy_before_sae",
+  "tracheostomy_after_sae", "first_day_vasopressin", "vasopressin_before_sae",
+  "vasopressin_after_sae", "first_day_phenylephrine", "phenylephrine_before_sae",
+  "phenylephrine_after_sae", "first_day_dopamine", "dopamine_before_sae",
+  "dopamine_after_sae"
+)
+
+# Keep only variables that are present in the dataset and flag any spelling issues.
+available_risk_factors = intersect(candidate_risk_factors, names(data))
+missing_from_dataset = setdiff(candidate_risk_factors, names(data))
+
+if (length(missing_from_dataset) > 0) {
+  warning(
+    "These requested variables were not found in the dataset: ",
+    paste(missing_from_dataset, collapse = ", ")
+  )
+}
+
+# Count missing values for each variable; blank text values are also treated as missing.
+missingness_table = data.table(
+  variable = available_risk_factors,
+  n_missing = sapply(data[, ..available_risk_factors], function(x) {
+    sum(is.na(x) | (is.character(x) & trimws(x) == ""))
+  })
+) %>%
+  mutate(
+    n_total = nrow(data),
+    percent_missing = round(100 * n_missing / n_total, 1),
+    percent_complete = round(100 - percent_missing, 1)
+  ) %>%
+  arrange(percent_missing, n_missing, variable)
+
+# Display variables ranked from lowest to highest missingness.
+knitr::kable(missingness_table)
+
+# Fill selected variables where missing has a clear clinical meaning.
+zero_fill_variables = c(
+  "first_day_hfnc", "first_day_invasive_vent", "first_day_noninvasive_vent",
+  "first_day_tracheostomy", "hfnc_after_sae", "hfnc_before_sae",
+  "invasive_vent_after_sae", "invasive_vent_before_sae",
+  "noninvasive_vent_after_sae", "noninvasive_vent_before_sae",
+  "tracheostomy_after_sae", "tracheostomy_before_sae",
+  "first_day_vasopressin", "vasopressin_before_sae",
+  "vasopressin_after_sae", "first_day_phenylephrine",
+  "phenylephrine_before_sae", "phenylephrine_after_sae",
+  "first_day_dopamine", "dopamine_before_sae", "dopamine_after_sae"
+)
+
+# Remove variables with more than 70% missingness, except variables filled by rules above.
+variables_removed_high_missingness = missingness_table %>%
+  filter(
+    percent_missing > 70,
+    !variable %in% c("language", zero_fill_variables)
+  ) %>%
+  pull(variable)
+
+variables_for_imputation = setdiff(
+  available_risk_factors,
+  variables_removed_high_missingness
+)
+
+# Create a separate modeling dataset so the original raw data remain unchanged.
+model_variables = c("hospital_death_flag", variables_for_imputation)
+model_variables = intersect(model_variables, names(data))
+sae_model_data = as.data.frame(data[, ..model_variables])
+
+# Treat blank character values as missing before filling and imputation.
+character_variables = names(sae_model_data)[sapply(sae_model_data, is.character)]
+for (variable_name in character_variables) {
+  sae_model_data[[variable_name]] = trimws(sae_model_data[[variable_name]])
+  sae_model_data[[variable_name]][sae_model_data[[variable_name]] == ""] = NA
+}
+
+# Fill missing language values with Unknown.
+if ("language" %in% names(sae_model_data)) {
+  sae_model_data$language[is.na(sae_model_data$language)] = "Unknown"
+}
+
+# Fill missing respiratory support, tracheostomy, and vasopressor indicators with 0.
+zero_fill_variables = intersect(zero_fill_variables, names(sae_model_data))
+for (variable_name in zero_fill_variables) {
+  sae_model_data[[variable_name]][is.na(sae_model_data[[variable_name]])] = 0
+}
+
+# Convert categorical variables to factors so mice uses categorical imputation methods.
+character_variables = names(sae_model_data)[sapply(sae_model_data, is.character)]
+sae_model_data[character_variables] = lapply(sae_model_data[character_variables], factor)
+
+# Perform multiple imputation for remaining missing values.
+imputation_method = mice::make.method(sae_model_data)
+if ("hospital_death_flag" %in% names(imputation_method)) {
+  imputation_method["hospital_death_flag"] = ""
+}
+
+# Use a compact predictor matrix to reduce instability from highly correlated before/after variables.
+imputation_predictors = mice::quickpred(
+  sae_model_data,
+  mincor = 0.10,
+  minpuc = 0.25,
+  include = intersect("hospital_death_flag", names(sae_model_data))
+)
+if ("hospital_death_flag" %in% rownames(imputation_predictors)) {
+  imputation_predictors["hospital_death_flag", ] = 0
+}
+
+set.seed(20260528)
+sae_imputation = mice(
+  sae_model_data,
+  m = 5,
+  method = imputation_method,
+  predictorMatrix = imputation_predictors,
+  maxit = 3,
+  remove.collinear = FALSE,
+  ridge = 1e-04,
+  printFlag = FALSE
+)
+
+# Use the first completed dataset for downstream single-dataset modeling.
+sae_model_data = mice::complete(sae_imputation, 1)
+imputation_logged_events = sae_imputation$loggedEvents
+
+# Confirm that the completed modeling dataset has no remaining missing values.
+remaining_missingness = data.frame(
+  variable = names(sae_model_data),
+  n_missing = colSums(is.na(sae_model_data))
+) %>%
+  filter(n_missing > 0)
+
+# Show which variables were removed before imputation due to high missingness.
+knitr::kable(data.frame(variable_removed = variables_removed_high_missingness))
+
+# Show any remaining missing values after rule-based filling and multiple imputation.
+knitr::kable(remaining_missingness)
+```
