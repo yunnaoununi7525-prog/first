@@ -1,0 +1,70 @@
+三个模型 logistic regression, XGBoost, lightGBM
+得出的AUC分别为0.784 0.774 0.775
+
+```{r modeling, message=FALSE, warning=FALSE}
+install.packages("pROC")
+install.packages("xgboost")
+install.packages("lightgbm")
+# 加载包
+library(pROC)
+library(xgboost)
+library(lightgbm)
+
+# 用你已有的 sae_model_data
+y_var <- "hospital_death_flag"
+
+# 划分训练集/测试集
+set.seed(123)
+train_index <- sample(1:nrow(sae_model_data), 0.7 * nrow(sae_model_data))
+train <- sae_model_data[train_index, ]
+test  <- sae_model_data[-train_index, ]
+
+# logistic regression
+log_model <- glm(hospital_death_flag ~ ., data = train, family = binomial)
+log_pred <- predict(log_model, newdata = test, type = "response")
+cat("Logistic AUC:", round(auc(test[[y_var]], log_pred), 3), "\n")
+
+# XGBoost
+x <- model.matrix(hospital_death_flag ~ ., train)[, -1]
+xt <- model.matrix(hospital_death_flag ~ ., test)[, -1]
+dtrain <- xgb.DMatrix(data = x, label = train[[y_var]])
+dtest  <- xgb.DMatrix(data = xt, label = test[[y_var]])
+
+# 把参数放进 params 里
+xgb_params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  max_depth = 2,
+  eta = 0.1
+)
+
+xgb_model <- xgb.train(
+  params = xgb_params,
+  data = dtrain,
+  nrounds = 50,
+  verbose = 0
+)
+
+xgb_pred <- predict(xgb_model, dtest)
+cat("XGBoost AUC:", round(auc(test[[y_var]], xgb_pred), 3), "\n")
+
+# LightGBM
+lgb_train <- lgb.Dataset(x, label = train[[y_var]])
+
+# 把参数放进 params 里
+lgb_params <- list(
+  objective = "binary",
+  metric = "auc",
+  max_depth = 2,
+  learning_rate = 0.1
+)
+
+lgb_model <- lgb.train(
+  params = lgb_params,
+  data = lgb_train,
+  nrounds = 50,
+  verbose = -1
+)
+
+lgb_pred <- predict(lgb_model, xt)
+cat("LightGBM AUC:", round(auc(test[[y_var]], lgb_pred), 3), "\n")
