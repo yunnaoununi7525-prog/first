@@ -1,0 +1,43 @@
+##生成了三张图 k=2 已经上传
+#gcs轨迹
+# 加载
+install.packages("flexmix")
+library(flexmix)
+library(ggplot2)
+
+# 抽样1000患者提速
+set.seed(123)
+id_sample <- sample(unique(trajectory_slim$subject_id),1000)
+df_samp <- trajectory_slim[trajectory_slim$subject_id %in% id_sample,]
+
+# 空模型：只GCS~小时，k=2分2类轨迹（后续可改k=3）
+fit_base <- flexmix(gcs_min ~ hour_offset | subject_id, k = 2, data = df_samp)
+summary(fit_base)
+
+# 正确提取分组
+df_samp$traj_group <- factor(clusters(fit_base))
+
+# 英文绘图代码
+ggplot(df_samp,aes(x = hour_offset, y = gcs_min, color = traj_group)) +
+  stat_summary(fun = mean, geom = "line", linewidth =1)+
+  labs(x="Hours after ICU admission",y="GCS score",color="Trajectory group",title="Latent trajectory of GCS (null model without covariates)")+
+  theme_bw()
+
+# 第二步：加入sofa_score，协变量影响分组概率
+fit_sofa <- flexmix(gcs_min ~ hour_offset | subject_id, k=2, concomitant = ~sofa_score, data=df_samp)
+df_samp$traj_sofa <- factor(clusters(fit_sofa))
+
+# 绘图
+ggplot(df_samp,aes(x = hour_offset, y = gcs_min, color = traj_sofa)) +
+  stat_summary(fun = mean, geom = "line", linewidth =1)+
+  labs(x="Hours after ICU admission",y="GCS score",color="Trajectory group",title="Latent trajectory of GCS adjusted for SOFA")+
+  theme_bw()
+
+# 继续新增age、gender、sepsis3
+fit_all <- flexmix(gcs_min ~ hour_offset | subject_id, k=2, concomitant = ~sofa_score+age+gender+sepsis3, data=df_samp)
+df_samp$traj_all <- factor(clusters(fit_all))
+
+ggplot(df_samp,aes(x = hour_offset, y = gcs_min, color = traj_all)) +
+  stat_summary(fun = mean, geom = "line", linewidth =1)+
+  labs(x="Hours after ICU admission",y="GCS score",color="Trajectory group",title="Latent trajectory of GCS adjusted for SOFA, age, gender and sepsis")+
+  theme_bw()
