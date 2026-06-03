@@ -1,76 +1,84 @@
-##加在修改版2.3后
-#轨迹模型数据格式
+##加在修改版2.3后 导出结果为df_teacher_new2.4_trajectory.csv
+新增核心列：hour_offset（相对ICU入院小时）、gcs_min（该小时最小GCS）
+
+# 加载
 library(dplyr)
 library(lubridate)
-library(tidyr)
+library(data.table)
 
-# 1. 取出目标 stay 列表
-target_stays <- unique(df_teacher_new$stay_id)
-safe_sql <- function(x) paste(unique(x), collapse = ",")
+# --------------------------
+# 1. 定义目标队列核心信息（从已有的df_teacher_new里取，不额外拉取）
+# --------------------------
+target_cohort = df_teacher_new %>%
+  select(subject_id, hadm_id, stay_id, intime) %>%
+  distinct() # 去重，确保每个stay_id唯一
+target_stay_ids = unique(target_cohort$stay_id)
 
-# 2. 拉取所有 ICU 期间的 GCS，并按小时聚合（同小时取 min）
-gcs_all <- bq_table_download(
-  bq_project_query(projectid, sprintf("
-    SELECT 
-      g.stay_id,
-      g.charttime,
-      g.gcs
-    FROM `physionet-data.mimiciv_3_1_derived.gcs` g
-    JOIN `physionet-data.mimiciv_3_1_icu.icustays` icu 
-      ON g.stay_id = icu.stay_id
-    WHERE g.stay_id IN (%s)
-      AND g.charttime >= icu.intime 
-      AND g.charttime <= icu.outtime
-      AND g.gcs IS NOT NULL
-  ", safe_sql(target_stays))),
+# --------------------------
+# 2. 拉取目标队列全量GCS时序数据（全ICU周期，不止前24h）
+# --------------------------
+# 安全SQL拼接函数
+safe_sql = function(x) paste(unique(x), collapse = ",")
+
+# 拉取GCS全量数据
+gcs_full_ts = bq_table_download(
+  bq_project_query(
+    projectid,
+    sprintf("
+      SELECT stay_id, charttime, gcs
+      FROM `physionet-data.mimiciv_3_1_derived.gcs`
+      WHERE stay_id IN (%s)
+    ", safe_sql(target_stay_ids))
+  ),
   page_size = 1e5
 )
 
-# 对齐到整点，并取同一小时的最小GCS
-gcs_hourly <- gcs_all %>%
-  mutate(charttime_h = floor_date(charttime, "hour")) %>%
-  group_by(stay_id, charttime_h) %>%
-  summarise(gcs_min = min(gcs), .groups = "drop")
-
-# 3. 为每个 stay 生成 intime→outtime 的每小时时间轴
-icustays <- bq_table_download(
-  bq_project_query(projectid, sprintf("
-    SELECT stay_id, intime, outtime
-    FROM `physionet-data.mimiciv_3_1_icu.icustays`
-    WHERE stay_id IN (%s)
-  ", safe_sql(target_stays))),
-  page_size = 1e5
-)
-
-# 生成每小时1行
-icu_time_grid <- icustays %>%
+# --------------------------
+# 3. 计算相对ICU入院的小时数（时间轴核心）
+# --------------------------
+gcs_with_hour = gcs_full_ts %>%
+  # 匹配患者入院时间
+  left_join(target_cohort, by = "stay_id") %>%
+  # 时间格式统一
   mutate(
-    hour_seq = purrr::map2(intime, outtime, ~ seq(floor_date(.x, "hour"), floor_date(.y, "hour"), by = "hour"))
+    intime = as.POSIXct(intime),
+    charttime = as.POSIXct(charttime),
+    # 核心：计算相对ICU入院的小时数，向下取整归到自然小时
+    hour_offset = floor(as.numeric(difftime(charttime, intime, units = "hour")))
   ) %>%
-  unnest(hour_seq) %>%
-  rename(charttime_h = hour_seq)
+  # 剔除入院前的无效数据（hour_offset<0）
+  filter(hour_offset >= 0)
 
-# 4. 把 GCS 和时间轴合并（没数据的小时为 NA）
-icu_gcs <- icu_time_grid %>%
-  left_join(gcs_hourly, by = c("stay_id", "charttime_h"))
+# --------------------------
+# 4. 同小时GCS取最小值
+# --------------------------
+# 用data.table高速聚合，解决百万行数据卡顿问题
+setDT(gcs_with_hour)
+gcs_hour_min = gcs_with_hour[,
+                             .(gcs_min = min(gcs, na.rm = TRUE)), # 同小时取min
+                             by = .(subject_id, hadm_id, stay_id, hour_offset) # 按患者+小时分组
+] %>%
+  as_tibble() %>%
+  # 核心排序：同一患者按小时从小到大排列（时间轴从过去到现在）
+  arrange(subject_id, hour_offset)
 
-# 5. 合并回你的主表，带上所有基线变量
-df_trajectory <- df_teacher_new %>%
-  select(subject_id, stay_id, age, everything()) %>%
-  left_join(icu_gcs, by = "stay_id") %>%
-  
-  # ✅ 关键排序：和你截图格式完全一致
-  arrange(
-    subject_id,    # 1. 先按患者分组，同一个人排在一起
-    age,           # 2. 同一个患者内部，按年龄从小到大
-    charttime_h    # 3. 同年龄按时间排序
+# --------------------------
+# 5. 完整保留原有数据，生成最终轨迹格式表
+# --------------------------
+trajectory_final_df = gcs_hour_min %>%
+  left_join(
+    df_teacher_new,
+    by = c("subject_id", "hadm_id", "stay_id") # 匹配患者ID
   ) %>%
-  
-  # 调整列顺序，让关键变量在前面
-  select(
-    subject_id, stay_id, age, charttime_h, gcs_min,
-    everything()
-  )
+  # 最终排序：确保同一患者的所有数据按时间轴连续排列
+  arrange(subject_id, hour_offset)
 
+# --------------------------
 # 6. 导出最终文件
-write.csv(df_trajectory, "~/Desktop/df_trajectory_final_hourly.csv", row.names = FALSE, na = "")
+# --------------------------
+write.csv(
+  trajectory_final_df,
+  "~/Desktop/df_teacher_new2.4_trajectory.csv",
+  row.names = FALSE,
+  na = ""
+)
