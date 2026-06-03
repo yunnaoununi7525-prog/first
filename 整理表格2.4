@@ -1,5 +1,4 @@
 ##加在修改版2.3后 导出结果为df_teacher_new2.4_trajectory.csv
-新增核心列：hour_offset（相对ICU入院小时）、gcs_min（该小时最小GCS）
 
 # 加载
 library(dplyr)
@@ -74,11 +73,12 @@ trajectory_final_df = gcs_hour_min %>%
   arrange(subject_id, hour_offset)
 
 # --------------------------
-# 6. 导出最终文件
-# --------------------------
-write.csv(
-  trajectory_final_df,
-  "~/Desktop/df_teacher_new2.4_trajectory.csv",
-  row.names = FALSE,
-  na = ""
-)
+# 筛选保留最小变量集
+trajectory_slim = trajectory_final_df %>%
+  select(subject_id,hadm_id,stay_id,
+         hour_offset,gcs_min, # 轨迹核心：时间+动态GCS
+         age,gender,sofa_score,sepsis3, # 关键基线协变量
+         hospital_death_flag,ninety_day_survival) # 结局变量
+
+# 导出精简版轨迹数据
+write.csv(trajectory_slim,"~/Desktop/df_teacher_new2.4_trajectory.csv",row.names=F,na="")
