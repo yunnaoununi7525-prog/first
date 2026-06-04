@@ -76,7 +76,7 @@ trajectory_final_df = gcs_hour_min %>%
 # 筛选保留最小变量集
 trajectory_slim = trajectory_final_df %>%
   select(subject_id,hadm_id,stay_id,
-         hour_offset,gcs_min, # 轨迹核心：时间+动态GCS
+         hour_offset,gcs_min,intime,outtime, # 轨迹核心：时间+动态GCS
          age,gender,sofa_score,sepsis3, # 关键基线协变量
          hospital_death_flag,ninety_day_survival) # 结局变量
 
