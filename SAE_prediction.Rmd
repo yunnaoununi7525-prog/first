@@ -1,0 +1,180 @@
+---
+title: "SAE_Prediction"
+output: html_document
+date: "2026-05-28"
+---
+
+```{r, echo=F}
+
+```
+
+```{r setup, include=FALSE}
+# Hide code by default in R Markdown output.
+knitr::opts_chunk$set(echo = FALSE)
+
+# Core data manipulation and reshaping packages.
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(data.table)
+
+# File input and output packages.
+library(readxl)
+library(gdata)
+library(writexl)
+
+# Date and clinical analysis packages.
+library(lubridate)
+library(comorbidity)
+library(table1)
+
+# BigQuery and database connection packages.
+library(bigrquery)
+library(DBI)
+library(dbplyr)
+
+# Modeling, reporting, and plot-composition packages.
+library(broom)
+library(patchwork)
+library(mice)
+```
+
+
+```{r,echo=F}
+
+projectid = "mimic-hr"
+bigrquery::bq_auth()
+
+sql <- "SELECT * FROM `physionet-data.mimiciv_3_1_derived.gcs` "
+bq_data <- bq_project_query(projectid, query = sql)
+gcs = bq_table_download(bq_data)
+
+
+# Load the SAE analysis dataset from the local CSV file.
+#data = fread("df2.3.csv")
+cohort = fread("df_sepsis3_clean_with_base_first_day_vars.csv")
+
+icd_exclusion = fread("ICD/sae_exclusion_codes_long.csv")
+
+gcs = gcs%>%filter(stay_id%in%cohort$stay_id)
+```
+
+## Seperate Normal GCS at first and Abnormal GCS 
+```{r,echo=F}
+first_gcs = gcs %>%
+  arrange(stay_id, charttime) %>%
+  group_by(stay_id) %>%
+  filter(!is.na(gcs)) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(stay_id, first_gcs = gcs, first_gcs_time = charttime)
+
+cohort_with_first_gcs = cohort %>%
+  inner_join(first_gcs, by = "stay_id")
+
+cohort_gcs_normal = cohort_with_first_gcs %>%
+  filter(first_gcs == 15)
+
+cohort_gcs_abnormal = cohort_with_first_gcs %>%
+  filter(first_gcs < 15)
+
+sae_from_gcs = cohort_gcs_normal %>%
+  select(stay_id, intime, outtime, first_gcs_time) %>%
+  mutate(
+    intime = as_datetime(intime),
+    outtime = as_datetime(outtime),
+    first_gcs_time = as_datetime(first_gcs_time),
+    gcs_followup_end = pmin(outtime, intime + days(14), na.rm = TRUE)
+  ) %>%
+  inner_join(
+    gcs %>%
+      filter(!is.na(gcs), gcs < 15) %>%
+      transmute(
+        stay_id,
+        abnormal_gcs_time = as_datetime(charttime),
+        abnormal_gcs = gcs
+      ),
+    by = "stay_id"
+  ) %>%
+  filter(
+    abnormal_gcs_time > first_gcs_time,
+    abnormal_gcs_time <= gcs_followup_end
+  ) %>%
+  group_by(stay_id) %>%
+  summarise(
+    SAE = 1,
+    SAE_time = min(abnormal_gcs_time),
+    .groups = "drop"
+  )
+
+cohort_gcs_normal = cohort_gcs_normal %>%
+  left_join(sae_from_gcs, by = "stay_id") %>%
+  mutate(SAE = replace_na(SAE, 0))
+
+```
+
+## GCS scores up to 14 days for normal first GCS cohort
+```{r,echo=F}
+cohort_normal_gcs = cohort_gcs_normal
+
+gcs_14d_cohort_normal_gcs = cohort_normal_gcs %>%
+  select(stay_id, intime, outtime) %>%
+  mutate(
+    intime = as_datetime(intime),
+    outtime = as_datetime(outtime),
+    gcs_followup_end = pmin(outtime, intime + days(14), na.rm = TRUE)
+  ) %>%
+  inner_join(
+    gcs %>%
+      filter(!is.na(gcs)) %>%
+      transmute(
+        stay_id,
+        gcs_time = as_datetime(charttime),
+        gcs
+      ),
+    by = "stay_id"
+  ) %>%
+  filter(
+    gcs_time >= intime,
+    gcs_time <= gcs_followup_end
+  ) %>%
+  arrange(stay_id, gcs_time)
+
+```
+
+
+
+### Table 1
+
+
+### Table 2
+
+
+### Trajectory Model (k=2/k=3)
+
+Using table "gcs_14d_cohort_normal_gcs" as longitudinal data.
+
+Then, create 2 columns indicating the cluster of the patient in table "cohort_gcs_normal"
+
+
+### Risk Model
+
+Build two logistic regression model of hospital_death_flag ~ cluster + first_day_SOFA + "first_day_invasive_vent"         +"first_day_noninvasive_vent"       
++"first_day_hfnc"                   
++"first_day_tracheostomy"
+
+On k=2 cluster and k=3 cluster separately. Plot forest plot with ggplot2 package. 
+
+### Prediction Model
+
+#### Model-1
+Predict hospital mortality using all the first_day data and demographics(gender,age)
+
+Plot the AUROC for three models and SHAP for XGboost
+
+
+#### Model-2
+Predict cluster using first day data (k=2/k=3 separately).
+
+Plot the AUROC for three models and SHAP for XGboost. (There will be two AUROC and two SHAP)
