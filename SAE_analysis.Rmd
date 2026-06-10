@@ -211,3 +211,12 @@ knitr::kable(data.frame(variable_removed = variables_removed_high_missingness))
 # Show any remaining missing values after rule-based filling and multiple imputation.
 knitr::kable(remaining_missingness)
 ```
+
+
+```{r,echo=FALSE}
+
+table1(
+  ~ gender + age + sofa_score | hospital_death_flag,
+  data = data
+)
+```
