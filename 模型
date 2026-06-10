@@ -1,0 +1,899 @@
+# Build the three requested model outputs from the latest clean cohort.
+#
+# Input:
+#   df_sepsis3_clean_with_base_first_day_vars_with_complete_death_outcomes.csv
+#   cohort_gcs_normal_with_gcs_trajectory_clusters_*.csv
+#
+# Outputs:
+#   1) Risk Model:
+#      Logistic regression forest plot for k=2, k=3, and k=4 cluster models.
+#   2) Prediction Model-1:
+#      Predict hospital mortality using first-day variables + age/gender.
+#      AUROC for three models + SHAP for XGBoost.
+#   3) Prediction Model-2:
+#      Predict k=2, k=3, and k=4 cluster membership using first-day variables.
+#      AUROC for three models + SHAP for XGBoost.
+#
+# Important:
+#   Model-2 must use true GCS latent trajectory classes as the outcome.
+#   Do not create first-day feature-based k-means clusters here, because that
+#   would make Model-2 circular: first-day features would be used to both create
+#   and predict the cluster labels.
+
+packages <- c("dplyr", "tidyr", "ggplot2", "xgboost", "glmnet", "nnet", "patchwork")
+to_install <- packages[!sapply(packages, requireNamespace, quietly = TRUE)]
+if (length(to_install) > 0) install.packages(to_install)
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(xgboost)
+library(glmnet)
+library(nnet)
+library(patchwork)
+
+set.seed(20260609)
+
+input_path <- "/Users/haoyunniu/Desktop/sepsis3_presepsis_exclusion_outputs/df_sepsis3_clean_with_base_first_day_vars_with_complete_death_outcomes.csv"
+trajectory_k2_path <- "/Users/haoyunniu/Desktop/gcs_trajectory_plots/cohort_gcs_normal_with_gcs_trajectory_clusters_7d_y12.csv"
+trajectory_k3_k4_path <- "/Users/haoyunniu/Desktop/gcs_trajectory_plots/cohort_gcs_normal_with_gcs_trajectory_clusters_7d_y12_k3_k4.csv"
+output_dir <- "/Users/haoyunniu/Desktop/sepsis3_presepsis_exclusion_outputs/model_requirement_outputs"
+
+if (!file.exists(input_path)) stop("Cannot find input table: ", input_path)
+if (!file.exists(trajectory_k2_path)) stop("Cannot find k=2 trajectory cluster table: ", trajectory_k2_path)
+if (!file.exists(trajectory_k3_k4_path)) stop("Cannot find k=3/k=4 trajectory cluster table: ", trajectory_k3_k4_path)
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+risk_pdf <- file.path(output_dir, "risk_model_logistic_forest_k2_k3_k4.pdf")
+risk_pdf_legacy <- file.path(output_dir, "risk_model_logistic_forest_k2_k3.pdf")
+model1_pdf <- file.path(output_dir, "prediction_model1_hospital_mortality_auroc_shap.pdf")
+model2_pdf <- file.path(output_dir, "prediction_model2_cluster_auroc_shap.pdf")
+combined_pdf <- file.path(output_dir, "all_three_requested_model_outputs.pdf")
+
+risk_csv <- file.path(output_dir, "risk_model_logistic_or_table.csv")
+model1_auc_csv <- file.path(output_dir, "prediction_model1_hospital_mortality_auc_table.csv")
+model2_auc_csv <- file.path(output_dir, "prediction_model2_cluster_auc_table.csv")
+cluster_summary_csv <- file.path(output_dir, "cluster_summary.csv")
+feature_summary_csv <- file.path(output_dir, "model_feature_missingness_summary.csv")
+
+df <- read.csv(input_path, stringsAsFactors = FALSE, check.names = FALSE)
+
+required_cols <- c("stay_id", "age", "gender", "sofa_score", "hospital_death_flag")
+missing_required <- setdiff(required_cols, names(df))
+if (length(missing_required) > 0) {
+  stop("Input table is missing required columns: ", paste(missing_required, collapse = ", "))
+}
+
+as_num <- function(x) suppressWarnings(as.numeric(x))
+is_missing <- function(x) is.na(x) | trimws(as.character(x)) == ""
+
+df <- df %>%
+  mutate(
+    hospital_death_flag = as.integer(as_num(hospital_death_flag) == 1),
+    first_day_SOFA = as_num(sofa_score),
+    male = as.integer(gender == "M")
+  ) %>%
+  filter(!is.na(hospital_death_flag))
+
+first_day_vars_all <- grep("^first_day_", names(df), value = TRUE)
+
+feature_candidates <- unique(c(
+  "age", "male", "first_day_SOFA",
+  first_day_vars_all,
+  "No_GCS_Measured",
+  "Sepsis_first_day"
+))
+feature_candidates <- feature_candidates[feature_candidates %in% names(df)]
+
+feature_stats <- data.frame(
+  feature = feature_candidates,
+  missing_n = sapply(df[feature_candidates], function(x) sum(is.na(as_num(x)))),
+  missing_pct = round(sapply(df[feature_candidates], function(x) mean(is.na(as_num(x))) * 100), 1),
+  n_unique_nonmissing = sapply(df[feature_candidates], function(x) length(unique(as_num(x)[!is.na(as_num(x))]))),
+  row.names = NULL
+)
+
+# Remove variables with extreme missingness or no variation.
+max_missing_pct <- 80
+model_features <- feature_stats %>%
+  filter(missing_pct <= max_missing_pct, n_unique_nonmissing > 1) %>%
+  pull(feature)
+
+write.csv(
+  feature_stats %>% mutate(used_in_prediction_models = feature %in% model_features),
+  feature_summary_csv,
+  row.names = FALSE,
+  na = ""
+)
+
+if (length(model_features) < 2) stop("Too few usable model features after filtering.")
+
+make_numeric_matrix <- function(data, features) {
+  out <- data %>%
+    select(all_of(features)) %>%
+    mutate(across(everything(), ~ as_num(.)))
+  as.matrix(out)
+}
+
+impute_by_train_median <- function(x_train, x_test) {
+  med <- apply(x_train, 2, function(x) {
+    m <- median(x, na.rm = TRUE)
+    ifelse(is.na(m), 0, m)
+  })
+
+  for (j in seq_along(med)) {
+    x_train[is.na(x_train[, j]), j] <- med[j]
+    x_test[is.na(x_test[, j]), j] <- med[j]
+  }
+
+  list(train = x_train, test = x_test, medians = med)
+}
+
+impute_matrix_all <- function(x) {
+  med <- apply(x, 2, function(v) {
+    m <- median(v, na.rm = TRUE)
+    ifelse(is.na(m), 0, m)
+  })
+
+  for (j in seq_along(med)) {
+    x[is.na(x[, j]), j] <- med[j]
+  }
+
+  x
+}
+
+make_stratified_split <- function(y, train_prop = 0.8) {
+  y <- as.factor(y)
+  idx <- seq_along(y)
+  train_idx <- unlist(lapply(split(idx, y), function(i) {
+    sample(i, size = max(1, floor(length(i) * train_prop)))
+  }), use.names = FALSE)
+  sort(unique(train_idx))
+}
+
+calc_auc <- function(actual, score) {
+  actual <- as_num(actual)
+  score <- as_num(score)
+  ok <- !is.na(actual) & !is.na(score)
+  actual <- actual[ok]
+  score <- score[ok]
+
+  if (length(unique(actual)) < 2) return(NA_real_)
+
+  n_pos <- sum(actual == 1)
+  n_neg <- sum(actual == 0)
+  if (n_pos == 0 || n_neg == 0) return(NA_real_)
+
+  ranks <- rank(score, ties.method = "average")
+  (sum(ranks[actual == 1]) - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+}
+
+roc_curve <- function(actual, score) {
+  actual <- as.integer(actual)
+  score <- as_num(score)
+  ok <- !is.na(actual) & !is.na(score)
+  actual <- actual[ok]
+  score <- score[ok]
+
+  ord <- order(score, decreasing = TRUE)
+  actual <- actual[ord]
+  score <- score[ord]
+
+  pos <- sum(actual == 1)
+  neg <- sum(actual == 0)
+  if (pos == 0 || neg == 0) {
+    return(data.frame(fpr = c(0, 1), tpr = c(0, 1)))
+  }
+
+  tp <- cumsum(actual == 1)
+  fp <- cumsum(actual == 0)
+
+  data.frame(
+    fpr = c(0, fp / neg, 1),
+    tpr = c(0, tp / pos, 1)
+  ) %>%
+    distinct(fpr, .keep_all = TRUE) %>%
+    arrange(fpr)
+}
+
+make_binary_roc_plot <- function(actual, prob_df, title) {
+  roc_rows <- list()
+  auc_rows <- list()
+
+  for (model_name in names(prob_df)) {
+    p <- prob_df[[model_name]]
+    auc_value <- calc_auc(actual, p)
+    curve <- roc_curve(actual, p) %>%
+      mutate(
+        model = paste0(model_name, " (AUC=", sprintf("%.3f", auc_value), ")"),
+        model_raw = model_name,
+        auc = auc_value
+      )
+    roc_rows[[model_name]] <- curve
+    auc_rows[[model_name]] <- data.frame(model = model_name, auc = auc_value)
+  }
+
+  roc_df <- bind_rows(roc_rows)
+  auc_df <- bind_rows(auc_rows)
+
+  plot <- ggplot(roc_df, aes(x = fpr, y = tpr, color = model)) +
+    geom_line(linewidth = 1.05) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey60") +
+    coord_equal() +
+    labs(title = title, x = "1 - Specificity", y = "Sensitivity", color = NULL) +
+    theme_classic(base_family = "Times") +
+    theme(
+      plot.title = element_text(size = 15, face = "bold", hjust = 0.5),
+      legend.position = "bottom"
+    )
+
+  list(plot = plot, auc = auc_df, roc = roc_df)
+}
+
+make_macro_roc_plot <- function(actual_class, prob_list, title) {
+  actual_class <- factor(actual_class)
+  classes <- levels(actual_class)
+  grid_fpr <- seq(0, 1, length.out = 101)
+
+  macro_rows <- list()
+  auc_rows <- list()
+
+  for (model_name in names(prob_list)) {
+    prob_mat <- prob_list[[model_name]]
+    class_aucs <- c()
+    tpr_grid <- matrix(NA_real_, nrow = length(grid_fpr), ncol = length(classes))
+
+    for (j in seq_along(classes)) {
+      cls <- classes[j]
+      actual_binary <- as.integer(actual_class == cls)
+      score <- prob_mat[, cls]
+      curve <- roc_curve(actual_binary, score)
+      class_aucs[j] <- calc_auc(actual_binary, score)
+      tpr_grid[, j] <- approx(
+        x = curve$fpr,
+        y = curve$tpr,
+        xout = grid_fpr,
+        ties = "ordered",
+        rule = 2
+      )$y
+    }
+
+    macro_auc <- mean(class_aucs, na.rm = TRUE)
+    macro_rows[[model_name]] <- data.frame(
+      fpr = grid_fpr,
+      tpr = rowMeans(tpr_grid, na.rm = TRUE),
+      model = paste0(model_name, " (macro AUC=", sprintf("%.3f", macro_auc), ")"),
+      model_raw = model_name,
+      auc = macro_auc
+    )
+    auc_rows[[model_name]] <- data.frame(model = model_name, auc = macro_auc)
+  }
+
+  roc_df <- bind_rows(macro_rows)
+  auc_df <- bind_rows(auc_rows)
+
+  plot <- ggplot(roc_df, aes(x = fpr, y = tpr, color = model)) +
+    geom_line(linewidth = 1.05) +
+    geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey60") +
+    coord_equal() +
+    labs(title = title, x = "1 - Specificity", y = "Sensitivity", color = NULL) +
+    theme_classic(base_family = "Times") +
+    theme(
+      plot.title = element_text(size = 15, face = "bold", hjust = 0.5),
+      legend.position = "bottom"
+    )
+
+  list(plot = plot, auc = auc_df, roc = roc_df)
+}
+
+pretty_feature <- function(x) {
+  label_map <- c(
+    age = "Age",
+    male = "Male",
+    first_day_SOFA = "First-day SOFA",
+    sofa_score = "SOFA score",
+    Sepsis_first_day = "Sepsis on first ICU day",
+    No_GCS_Measured = "No GCS measured before sepsis",
+    first_day_gcs = "First-day GCS",
+    first_day_cam_icu = "First-day CAM-ICU positive",
+    first_day_delirium_drug = "First-day delirium drug",
+    first_day_drug_used = "First-day delirium drug",
+    first_day_wbc = "First-day WBC",
+    first_day_hemoglobin = "First-day hemoglobin",
+    first_day_platelet = "First-day platelet",
+    first_day_sodium = "First-day sodium",
+    first_day_potassium = "First-day potassium",
+    first_day_chloride = "First-day chloride",
+    first_day_bicarbonate = "First-day bicarbonate",
+    first_day_bun = "First-day BUN",
+    first_day_creatinine = "First-day creatinine",
+    first_day_glucose = "First-day glucose",
+    first_day_alt = "First-day ALT",
+    first_day_ast = "First-day AST",
+    first_day_bilirubin_total = "First-day total bilirubin",
+    first_day_pt = "First-day PT",
+    first_day_inr = "First-day INR",
+    first_day_ptt = "First-day PTT",
+    first_day_fibrinogen = "First-day fibrinogen",
+    first_day_invasive_vent = "First-day invasive ventilation",
+    first_day_noninvasive_vent = "First-day noninvasive ventilation",
+    first_day_hfnc = "First-day HFNC",
+    first_day_tracheostomy = "First-day tracheostomy",
+    first_day_norepinephrine = "First-day norepinephrine",
+    first_day_epinephrine = "First-day epinephrine",
+    first_day_vasopressin = "First-day vasopressin",
+    first_day_phenylephrine = "First-day phenylephrine",
+    first_day_dopamine = "First-day dopamine"
+  )
+
+  out <- unname(label_map[x])
+  missing_label <- is.na(out)
+  out[missing_label] <- gsub("_", " ", x[missing_label])
+  out
+}
+
+scale_feature_value <- function(x) {
+  x <- as_num(x)
+  if (all(is.na(x))) return(rep(NA_real_, length(x)))
+  q25 <- quantile(x, 0.25, na.rm = TRUE, names = FALSE)
+  q75 <- quantile(x, 0.75, na.rm = TRUE, names = FALSE)
+  iqr_x <- q75 - q25
+  if (is.na(iqr_x) || iqr_x == 0) {
+    z <- x - median(x, na.rm = TRUE)
+  } else {
+    z <- (x - median(x, na.rm = TRUE)) / iqr_x
+  }
+  pmax(pmin(z, 2), -2)
+}
+
+make_shap_plot <- function(xgb_model, x_test, title, top_n = 10) {
+  shap_values <- predict(xgb_model, xgb.DMatrix(x_test), predcontrib = TRUE)
+
+  expected_names <- c(colnames(x_test), "BIAS")
+  if (
+    is.null(colnames(shap_values)) ||
+      length(colnames(shap_values)) != length(expected_names) ||
+      !all(colnames(shap_values) %in% expected_names)
+  ) {
+    colnames(shap_values) <- expected_names[seq_len(ncol(shap_values))]
+  }
+
+  shap_values <- shap_values[, colnames(shap_values) != "BIAS", drop = FALSE]
+
+  common_features <- intersect(colnames(shap_values), colnames(x_test))
+  shap_values <- shap_values[, common_features, drop = FALSE]
+
+  shap_importance <- data.frame(
+    feature = colnames(shap_values),
+    mean_abs_shap = colMeans(abs(shap_values), na.rm = TRUE),
+    row.names = NULL
+  ) %>%
+    arrange(desc(mean_abs_shap))
+
+  top_features <- shap_importance$feature[seq_len(min(top_n, nrow(shap_importance)))]
+
+  shap_long <- as.data.frame(shap_values[, top_features, drop = FALSE]) %>%
+    mutate(row_id = row_number()) %>%
+    pivot_longer(cols = all_of(top_features), names_to = "feature", values_to = "shap_value")
+
+  value_long <- as.data.frame(x_test[, top_features, drop = FALSE]) %>%
+    mutate(row_id = row_number()) %>%
+    pivot_longer(cols = all_of(top_features), names_to = "feature", values_to = "feature_value")
+
+  feature_order <- rev(top_features)
+  feature_labels <- pretty_feature(feature_order)
+  names(feature_labels) <- feature_order
+
+  shap_long <- shap_long %>%
+    left_join(value_long, by = c("row_id", "feature")) %>%
+    group_by(feature) %>%
+    mutate(feature_value_scaled = scale_feature_value(feature_value)) %>%
+    ungroup() %>%
+    mutate(
+      feature = factor(feature, levels = feature_order),
+      feature_label = factor(pretty_feature(as.character(feature)), levels = feature_labels)
+    )
+
+  plot <- ggplot(shap_long, aes(x = shap_value, y = feature_label, color = feature_value_scaled)) +
+    geom_vline(xintercept = 0, color = "grey35", linewidth = 0.55) +
+    geom_point(alpha = 0.68, size = 1.3, position = position_jitter(height = 0.18, width = 0)) +
+    scale_color_gradient(low = "#7A7A7A", high = "#1F78B4", na.value = "#BDBDBD", name = "Feature value") +
+    labs(title = title, x = "SHAP value impact", y = NULL) +
+    theme_classic(base_family = "Times") +
+    theme(
+      plot.title = element_text(size = 15, face = "bold", hjust = 0.5),
+      axis.title.x = element_text(size = 12, face = "bold"),
+      axis.text.y = element_text(size = 10.5),
+      legend.position = "right"
+    )
+
+  list(plot = plot, importance = shap_importance)
+}
+
+fit_predict_binary_models <- function(data, outcome, features, title_prefix) {
+  data <- data %>%
+    filter(!is.na(.data[[outcome]]))
+
+  y <- as.integer(data[[outcome]] == 1)
+  if (length(unique(y)) < 2) {
+    stop(title_prefix, " has fewer than 2 outcome classes after excluding missing labels.")
+  }
+
+  train_idx <- make_stratified_split(y)
+  test_idx <- setdiff(seq_along(y), train_idx)
+
+  x_all <- make_numeric_matrix(data, features)
+  x_train <- x_all[train_idx, , drop = FALSE]
+  x_test <- x_all[test_idx, , drop = FALSE]
+  imp <- impute_by_train_median(x_train, x_test)
+  x_train <- imp$train
+  x_test <- imp$test
+  y_train <- y[train_idx]
+  y_test <- y[test_idx]
+
+  train_df <- as.data.frame(x_train)
+  train_df$.y <- y_train
+  test_df <- as.data.frame(x_test)
+
+  glm_fit <- suppressWarnings(glm(.y ~ ., data = train_df, family = binomial()))
+  pred_glm <- suppressWarnings(as.numeric(predict(glm_fit, newdata = test_df, type = "response")))
+
+  cv_glmnet <- suppressWarnings(cv.glmnet(
+    x = x_train,
+    y = y_train,
+    family = "binomial",
+    alpha = 1,
+    nfolds = 5,
+    type.measure = "auc",
+    standardize = TRUE
+  ))
+  pred_glmnet <- as.numeric(predict(cv_glmnet, newx = x_test, s = "lambda.min", type = "response"))
+
+  dtrain <- xgb.DMatrix(x_train, label = y_train)
+  dtest <- xgb.DMatrix(x_test, label = y_test)
+  xgb_fit <- xgb.train(
+    params = list(
+      objective = "binary:logistic",
+      eval_metric = "auc",
+      max_depth = 3,
+      eta = 0.05,
+      min_child_weight = 10,
+      subsample = 0.85,
+      colsample_bytree = 0.85,
+      scale_pos_weight = sum(y_train == 0) / sum(y_train == 1)
+    ),
+    data = dtrain,
+    nrounds = 250,
+    verbose = 0
+  )
+  pred_xgb <- as.numeric(predict(xgb_fit, dtest))
+
+  prob_df <- list(
+    "Logistic regression" = pred_glm,
+    "LASSO logistic" = pred_glmnet,
+    "XGBoost" = pred_xgb
+  )
+
+  roc_result <- make_binary_roc_plot(
+    actual = y_test,
+    prob_df = prob_df,
+    title = paste0(title_prefix, ": AUROC")
+  )
+
+  shap_result <- make_shap_plot(
+    xgb_model = xgb_fit,
+    x_test = x_test,
+    title = paste0(title_prefix, ": XGBoost SHAP")
+  )
+
+  list(
+    roc_plot = roc_result$plot,
+    auc = roc_result$auc,
+    shap_plot = shap_result$plot,
+    shap_importance = shap_result$importance,
+    xgb_model = xgb_fit,
+    x_test = x_test,
+    y_test = y_test
+  )
+}
+
+fit_predict_multiclass_models <- function(data, outcome, features, title_prefix) {
+  data <- data %>%
+    filter(!is.na(.data[[outcome]]), trimws(as.character(.data[[outcome]])) != "")
+
+  y <- droplevels(factor(data[[outcome]]))
+  classes <- levels(y)
+  if (length(classes) < 2) {
+    stop(title_prefix, " has fewer than 2 outcome classes after excluding missing labels.")
+  }
+
+  train_idx <- make_stratified_split(y)
+  test_idx <- setdiff(seq_along(y), train_idx)
+
+  x_all <- make_numeric_matrix(data, features)
+  x_train <- x_all[train_idx, , drop = FALSE]
+  x_test <- x_all[test_idx, , drop = FALSE]
+  imp <- impute_by_train_median(x_train, x_test)
+  x_train <- imp$train
+  x_test <- imp$test
+  y_train <- factor(y[train_idx], levels = classes)
+  y_test <- factor(y[test_idx], levels = classes)
+
+  train_df <- as.data.frame(x_train)
+  train_df$.y <- y_train
+  test_df <- as.data.frame(x_test)
+
+  multinom_fit <- suppressWarnings(nnet::multinom(.y ~ ., data = train_df, trace = FALSE, maxit = 300))
+  pred_multinom <- predict(multinom_fit, newdata = test_df, type = "probs")
+  if (is.null(dim(pred_multinom))) {
+    pred_multinom <- cbind(`1` = 1 - pred_multinom, `2` = pred_multinom)
+  }
+  pred_multinom <- as.matrix(pred_multinom)
+  colnames(pred_multinom) <- classes
+
+  y_train_num <- as.integer(y_train) - 1
+  y_test_num <- as.integer(y_test) - 1
+
+  cv_glmnet <- suppressWarnings(cv.glmnet(
+    x = x_train,
+    y = y_train,
+    family = "multinomial",
+    alpha = 1,
+    nfolds = 5,
+    type.measure = "deviance",
+    standardize = TRUE
+  ))
+  pred_glmnet_arr <- predict(cv_glmnet, newx = x_test, s = "lambda.min", type = "response")
+  pred_glmnet <- pred_glmnet_arr[, , 1, drop = TRUE]
+  pred_glmnet <- as.matrix(pred_glmnet)
+  colnames(pred_glmnet) <- classes
+
+  dtrain <- xgb.DMatrix(x_train, label = y_train_num)
+  dtest <- xgb.DMatrix(x_test, label = y_test_num)
+  xgb_fit <- xgb.train(
+    params = list(
+      objective = "multi:softprob",
+      eval_metric = "mlogloss",
+      num_class = length(classes),
+      max_depth = 3,
+      eta = 0.05,
+      min_child_weight = 10,
+      subsample = 0.85,
+      colsample_bytree = 0.85
+    ),
+    data = dtrain,
+    nrounds = 250,
+    verbose = 0
+  )
+  pred_xgb_raw <- predict(xgb_fit, dtest)
+  pred_xgb <- as.matrix(pred_xgb_raw)
+
+  if (ncol(pred_xgb) != length(classes)) {
+    pred_xgb_vec <- as.numeric(pred_xgb_raw)
+    pred_xgb_byrow <- matrix(pred_xgb_vec, ncol = length(classes), byrow = TRUE)
+    pred_xgb_bycol <- matrix(pred_xgb_vec, ncol = length(classes), byrow = FALSE)
+
+    # Choose the orientation with the better macro AUC on the test set.
+    colnames(pred_xgb_byrow) <- classes
+    colnames(pred_xgb_bycol) <- classes
+    auc_byrow <- make_macro_roc_plot(y_test, list(x = pred_xgb_byrow), "tmp")$auc$auc[1]
+    auc_bycol <- make_macro_roc_plot(y_test, list(x = pred_xgb_bycol), "tmp")$auc$auc[1]
+    pred_xgb <- if (is.na(auc_bycol) || (!is.na(auc_byrow) && auc_byrow >= auc_bycol)) {
+      pred_xgb_byrow
+    } else {
+      pred_xgb_bycol
+    }
+  }
+  colnames(pred_xgb) <- classes
+
+  prob_list <- list(
+    "Multinomial logistic" = pred_multinom,
+    "LASSO multinomial" = pred_glmnet,
+    "XGBoost" = pred_xgb
+  )
+
+  roc_result <- make_macro_roc_plot(
+    actual_class = y_test,
+    prob_list = prob_list,
+    title = paste0(title_prefix, ": Macro-average AUROC")
+  )
+
+  list(
+    roc_plot = roc_result$plot,
+    auc = roc_result$auc,
+    xgb_model = xgb_fit,
+    x_test = x_test,
+    y_test = y_test,
+    train_idx = train_idx,
+    test_idx = test_idx
+  )
+}
+
+# ====================== Cluster variables ======================
+cluster_source <- "gcs_latent_trajectory_base_model_7d_y12"
+
+clean_cluster_label <- function(x, k) {
+  x <- trimws(as.character(x))
+  x[x == ""] <- NA_character_
+  factor(x, levels = paste0("Class ", seq_len(k)))
+}
+
+read_trajectory_clusters <- function(path, cols) {
+  trajectory_df <- read.csv(path, stringsAsFactors = FALSE, check.names = FALSE)
+  required <- c("stay_id", cols)
+  missing_cols <- setdiff(required, names(trajectory_df))
+  if (length(missing_cols) > 0) {
+    stop("Trajectory cluster table is missing required columns: ", paste(missing_cols, collapse = ", "))
+  }
+
+  trajectory_df %>%
+    select(all_of(required)) %>%
+    mutate(stay_id = as.character(stay_id)) %>%
+    distinct(stay_id, .keep_all = TRUE)
+}
+
+trajectory_clusters <- read_trajectory_clusters(
+  trajectory_k2_path,
+  c("gcs_cluster_base_k2")
+) %>%
+  full_join(
+    read_trajectory_clusters(
+      trajectory_k3_k4_path,
+      c("gcs_cluster_base_k3", "gcs_cluster_base_k4")
+    ),
+    by = "stay_id"
+  ) %>%
+  transmute(
+    stay_id,
+    cluster_k2 = clean_cluster_label(gcs_cluster_base_k2, 2),
+    cluster_k3 = clean_cluster_label(gcs_cluster_base_k3, 3),
+    cluster_k4 = clean_cluster_label(gcs_cluster_base_k4, 4)
+  )
+
+df <- df %>%
+  mutate(stay_id = as.character(stay_id)) %>%
+  select(-any_of(c("cluster_k2", "cluster_k3", "cluster_k4"))) %>%
+  left_join(trajectory_clusters, by = "stay_id")
+
+for (cluster_col in c("cluster_k2", "cluster_k3", "cluster_k4")) {
+  if (all(is.na(df[[cluster_col]]))) {
+    stop(cluster_col, " has no non-missing GCS trajectory labels after joining by stay_id.")
+  }
+}
+
+make_cluster_summary <- function(cluster_col, label) {
+  labelled_n <- sum(!is.na(df[[cluster_col]]))
+  missing_cluster_n <- sum(is.na(df[[cluster_col]]))
+
+  df %>%
+    filter(!is.na(.data[[cluster_col]])) %>%
+    group_by(cluster = .data[[cluster_col]]) %>%
+    summarise(
+      n = n(),
+      death_rate = mean(hospital_death_flag == 1, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      cluster_model = label,
+      labelled_n = labelled_n,
+      missing_cluster_n = missing_cluster_n,
+      cluster_source = cluster_source
+    ) %>%
+    select(cluster_model, cluster, n, death_rate, labelled_n, missing_cluster_n, cluster_source)
+}
+
+cluster_summary <- bind_rows(
+  make_cluster_summary("cluster_k2", "k=2"),
+  make_cluster_summary("cluster_k3", "k=3"),
+  make_cluster_summary("cluster_k4", "k=4")
+)
+
+write.csv(cluster_summary, cluster_summary_csv, row.names = FALSE, na = "")
+
+# ====================== 1) Risk Model ======================
+risk_features <- c(
+  "first_day_SOFA",
+  "first_day_invasive_vent",
+  "first_day_noninvasive_vent",
+  "first_day_hfnc",
+  "first_day_tracheostomy"
+)
+risk_features <- risk_features[risk_features %in% names(df)]
+
+fit_risk_model <- function(cluster_col, label) {
+  model_data <- df %>%
+    select(hospital_death_flag, all_of(cluster_col), all_of(risk_features)) %>%
+    rename(cluster = all_of(cluster_col)) %>%
+    mutate(cluster = factor(cluster)) %>%
+    mutate(across(all_of(risk_features), ~ as_num(.))) %>%
+    drop_na(hospital_death_flag, cluster) %>%
+    mutate(cluster = droplevels(cluster))
+
+  if (nlevels(model_data$cluster) < 2) {
+    stop(label, " has fewer than 2 GCS trajectory classes after excluding missing labels.")
+  }
+
+  for (v in risk_features) {
+    med <- median(model_data[[v]], na.rm = TRUE)
+    if (is.na(med)) med <- 0
+    model_data[[v]][is.na(model_data[[v]])] <- med
+  }
+
+  fit <- suppressWarnings(glm(
+    hospital_death_flag ~ cluster + first_day_SOFA +
+      first_day_invasive_vent + first_day_noninvasive_vent +
+      first_day_hfnc + first_day_tracheostomy,
+    data = model_data,
+    family = binomial()
+  ))
+
+  coef_df <- as.data.frame(summary(fit)$coefficients)
+  coef_df$term <- rownames(coef_df)
+  rownames(coef_df) <- NULL
+  names(coef_df)[1:4] <- c("estimate", "std_error", "z", "p_value")
+
+  coef_df %>%
+    filter(term != "(Intercept)") %>%
+    mutate(
+      model = label,
+      OR = exp(estimate),
+      CI_low = exp(estimate - 1.96 * std_error),
+      CI_high = exp(estimate + 1.96 * std_error),
+      term_label = case_when(
+        grepl("^cluster", term) ~ paste0(gsub("^cluster", "", term), " vs Cluster 1"),
+        term == "first_day_SOFA" ~ "First-day SOFA",
+        term == "first_day_invasive_vent" ~ "First-day invasive ventilation",
+        term == "first_day_noninvasive_vent" ~ "First-day noninvasive ventilation",
+        term == "first_day_hfnc" ~ "First-day HFNC",
+        term == "first_day_tracheostomy" ~ "First-day tracheostomy",
+        TRUE ~ pretty_feature(term)
+      )
+    )
+}
+
+risk_results <- bind_rows(
+  fit_risk_model("cluster_k2", "k=2 cluster model"),
+  fit_risk_model("cluster_k3", "k=3 cluster model"),
+  fit_risk_model("cluster_k4", "k=4 cluster model")
+)
+
+write.csv(
+  risk_results %>%
+    select(model, term, term_label, estimate, std_error, OR, CI_low, CI_high, p_value),
+  risk_csv,
+  row.names = FALSE,
+  na = ""
+)
+
+risk_plot <- risk_results %>%
+  mutate(
+    term_label = factor(term_label, levels = rev(unique(term_label))),
+    model = factor(model, levels = c("k=2 cluster model", "k=3 cluster model", "k=4 cluster model"))
+  ) %>%
+  ggplot(aes(x = OR, y = term_label)) +
+  geom_vline(xintercept = 1, linetype = 2, color = "grey55") +
+  geom_errorbar(aes(xmin = CI_low, xmax = CI_high), width = 0.2, orientation = "y", color = "#333333") +
+  geom_point(size = 2.4, color = "#1F78B4") +
+  scale_x_log10() +
+  facet_wrap(~ model, scales = "free_y") +
+  labs(
+    title = "Risk Model: Logistic Regression for In-Hospital Death",
+    subtitle = "hospital_death_flag ~ cluster + first_day_SOFA + first-day respiratory support",
+    x = "Odds ratio (log scale)",
+    y = NULL
+  ) +
+  theme_classic(base_family = "Times") +
+  theme(
+    plot.title = element_text(size = 15, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 10.5, hjust = 0.5),
+    strip.text = element_text(face = "bold", size = 11)
+  )
+
+ggsave(risk_pdf, risk_plot, width = 12.6, height = 6.8)
+ggsave(risk_pdf_legacy, risk_plot, width = 12.6, height = 6.8)
+
+# ====================== 2) Prediction Model-1 ======================
+model1 <- fit_predict_binary_models(
+  data = df,
+  outcome = "hospital_death_flag",
+  features = model_features,
+  title_prefix = "Prediction Model-1: Hospital mortality"
+)
+
+write.csv(
+  model1$auc %>% mutate(model_task = "Model-1: hospital mortality"),
+  model1_auc_csv,
+  row.names = FALSE,
+  na = ""
+)
+
+pdf(model1_pdf, width = 9.5, height = 6.6)
+print(model1$roc_plot)
+print(model1$shap_plot)
+dev.off()
+
+# ====================== 3) Prediction Model-2 ======================
+model2_features <- model_features
+
+k2_target_class <- levels(droplevels(df$cluster_k2))[length(levels(droplevels(df$cluster_k2)))]
+model2_k2 <- fit_predict_binary_models(
+  data = df %>% mutate(cluster_k2_event = as.integer(cluster_k2 == k2_target_class)),
+  outcome = "cluster_k2_event",
+  features = model2_features,
+  title_prefix = paste0("Prediction Model-2: k=2 ", k2_target_class, " vs others")
+)
+
+model2_k3_auc <- fit_predict_multiclass_models(
+  data = df,
+  outcome = "cluster_k3",
+  features = model2_features,
+  title_prefix = "Prediction Model-2: k=3 cluster"
+)
+
+model2_k4_auc <- fit_predict_multiclass_models(
+  data = df,
+  outcome = "cluster_k4",
+  features = model2_features,
+  title_prefix = "Prediction Model-2: k=4 cluster"
+)
+
+# SHAP for multiclass cluster models is shown as the last class vs all other classes.
+highest_k3 <- levels(droplevels(df$cluster_k3))[length(levels(droplevels(df$cluster_k3)))]
+model2_k3_shap <- fit_predict_binary_models(
+  data = df %>% mutate(cluster_k3_high_risk = as.integer(cluster_k3 == highest_k3)),
+  outcome = "cluster_k3_high_risk",
+  features = model2_features,
+  title_prefix = paste0("Prediction Model-2: k=3 ", highest_k3, " vs others")
+)
+
+highest_k4 <- levels(droplevels(df$cluster_k4))[length(levels(droplevels(df$cluster_k4)))]
+model2_k4_shap <- fit_predict_binary_models(
+  data = df %>% mutate(cluster_k4_high_risk = as.integer(cluster_k4 == highest_k4)),
+  outcome = "cluster_k4_high_risk",
+  features = model2_features,
+  title_prefix = paste0("Prediction Model-2: k=4 ", highest_k4, " vs others")
+)
+
+model2_auc <- bind_rows(
+  model2_k2$auc %>% mutate(model_task = paste0("Model-2: k=2 ", k2_target_class, " vs others")),
+  model2_k3_auc$auc %>% mutate(model_task = "Model-2: k=3 cluster macro-average"),
+  model2_k4_auc$auc %>% mutate(model_task = "Model-2: k=4 cluster macro-average")
+)
+
+write.csv(model2_auc, model2_auc_csv, row.names = FALSE, na = "")
+
+pdf(model2_pdf, width = 9.5, height = 6.6)
+print(model2_k2$roc_plot)
+print(model2_k2$shap_plot)
+print(model2_k3_auc$roc_plot)
+print(model2_k3_shap$shap_plot)
+print(model2_k4_auc$roc_plot)
+print(model2_k4_shap$shap_plot)
+dev.off()
+
+# Combined PDF for quick review.
+pdf(combined_pdf, width = 10.5, height = 7)
+print(risk_plot)
+print(model1$roc_plot)
+print(model1$shap_plot)
+print(model2_k2$roc_plot)
+print(model2_k2$shap_plot)
+print(model2_k3_auc$roc_plot)
+print(model2_k3_shap$shap_plot)
+print(model2_k4_auc$roc_plot)
+print(model2_k4_shap$shap_plot)
+dev.off()
+
+cat("All requested model outputs generated.\n")
+cat("Input file: ", input_path, "\n", sep = "")
+cat("Output directory: ", output_dir, "\n", sep = "")
+cat("Cluster source: ", cluster_source, "\n", sep = "")
+cat("Risk model PDF: ", risk_pdf, "\n", sep = "")
+cat("Prediction Model-1 PDF: ", model1_pdf, "\n", sep = "")
+cat("Prediction Model-2 PDF: ", model2_pdf, "\n", sep = "")
+cat("Combined PDF: ", combined_pdf, "\n", sep = "")
+cat("Risk model CSV: ", risk_csv, "\n", sep = "")
+cat("Model-1 AUROC CSV: ", model1_auc_csv, "\n", sep = "")
+cat("Model-2 AUROC CSV: ", model2_auc_csv, "\n", sep = "")
+cat("Cluster summary CSV: ", cluster_summary_csv, "\n", sep = "")
+cat("Feature summary CSV: ", feature_summary_csv, "\n", sep = "")
