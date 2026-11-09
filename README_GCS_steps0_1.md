@@ -1,9 +1,11 @@
-# GCS steps 0 and 1 code snapshot
+# GCS steps 0–1: source recovery and validation snapshot
 
-The code_only_backup.zip archive contains the independent runnable project, including R and SQL scripts, tests, README, source selection notes and renv.lock. Extract it and open gcs_early_sepsis.Rproj. The folder hierarchy is preserved inside the archive.
+Code snapshot: local commit 432d7ea, 2026-11-09. Unzip code_only_backup.zip to obtain R/, sql/, tests/, tools/, docs/, environment lock and example configuration. The original repository main branch is unchanged.
 
-No patient-level data, fitted models, source archives, credentials or private BigQuery configuration are included. The original main branch is unchanged. The fully populated local project is maintained separately on the research computer.
+This revision adds reproducible raw eICU extraction and MIMIC CAM, medication-order, SOFA and admission/death sources. It fixes 64-bit nursing-record identifier overflow and preserves GCS observations for stays with unknown ICU discharge time without inventing follow-up duration.
 
-Verified locally: 2,000,738 reconstructed GCS assessments; 1,591,050 valid assessments; official Jointlcmm example converged; helper and real-output checks passed; 20 subjects independently checked against raw source records. These are broad extraction-frame counts before the step-2 sepsis cohort selection. Some historical generator scripts remain unavailable; see the selection report.
+Validated MIMIC output: 2,001,331 assessments; 1,591,242 valid assessments. Unknown-discharge handling restored 593 assessments. Raw eICU neurological extract: 13,796,460 records with complete unique primary identifiers. Ten source extracts, original and new regression tests, full GCS acceptance and fixed 20-subject independent checks passed. 132 original local files retain their SHA256 checksums.
 
-Local code commit: 9551909. Database versions: MIMIC-IV 3.1 and eICU-CRD 2.0. R 4.5.3; lcmm 2.2.2.
+This is NOT a claim that every research-plan requirement is complete: old final-dataset/classification provenance remains unavailable; human source-review signoff and group presentation remain pending. New final cohorts and trajectory models have not been built in this revision. The detailed docs inside the archive describe the state immediately before this publication; this outer README identifies the uploaded snapshot.
+
+Only code, documentation and aggregate counts are included. No patient-level records, fitted models, private configuration or login tokens are uploaded.
